@@ -1,0 +1,8 @@
+opencv-python
+pytesseract
+pillow
+easyocr
+deep-translator
+matplotlib
+paddlepaddle==2.6.2
+paddleocr==2.8.1
