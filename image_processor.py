@@ -288,19 +288,36 @@ class ImageProcessor:
             text_width = max(line_widths) if line_widths else 10
             text_height = sum(line_heights) + (len(lines) - 1) * spacing if line_heights else 10
 
-            pad = 4
-            txt_w = int(text_width) + pad*2
-            txt_h = int(text_height) + pad*2
+            pts = box["points"]
+            # Matematyczne długości boków tła dla idealnej nowej warstwy
+            box_w = math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1])
+            box_h = math.hypot(pts[3][0] - pts[0][0], pts[3][1] - pts[0][1])
 
-            txt_img = Image.new('RGBA', (txt_w, txt_h), (255, 255, 255, 0))
+            pad = 2
+            # Kanwa ma rozmiar dopasowany do większego elementu (Tekst vs Ramka tła)
+            canvas_w = max(text_width, box_w) + pad*2
+            canvas_h = max(text_height, box_h) + pad*2
+
+            txt_img = Image.new('RGBA', (int(canvas_w), int(canvas_h)), (255, 255, 255, 0))
             draw = ImageDraw.Draw(txt_img)
 
-            current_y = pad
+            # Podstawa justowania poziomego
+            if box["alignment"] == "Lewo": base_tx = pad
+            elif box["alignment"] == "Prawo": base_tx = canvas_w - text_width - pad
+            else: base_tx = (canvas_w - text_width) / 2.0
+
+            # Podstawa justowania pionowego
+            if box.get("valign", "Środek") == "Góra": base_ty = pad
+            elif box.get("valign", "Środek") == "Dół": base_ty = canvas_h - text_height - pad
+            else: base_ty = (canvas_h - text_height) / 2.0
+
+            current_y = base_ty
             for i, p_line in enumerate(parsed_lines):
                 lw = line_widths[i]
-                if box["alignment"] == "Lewo": tx = pad
-                elif box["alignment"] == "Prawo": tx = pad + text_width - lw
-                else: tx = pad + (text_width - lw) / 2
+                # Pociągnięcie wyjustowania dla pojedynczych linijek w bloku tekstu
+                if box["alignment"] == "Lewo": tx = base_tx
+                elif box["alignment"] == "Prawo": tx = base_tx + (text_width - lw)
+                else: tx = base_tx + (text_width - lw) / 2.0
 
                 current_x = tx
                 for type_, txt in p_line:
@@ -314,40 +331,12 @@ class ImageProcessor:
             angle = box.get("angle", 0.0)
             rotated_txt_img = txt_img.rotate(-angle, expand=True, resample=Image.BICUBIC)
 
-            pts = box["points"]
-            box_w = math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1])
-            box_h = math.hypot(pts[3][0] - pts[0][0], pts[3][1] - pts[0][1])
+            # Srodek geometryczny tła jest też zawsze idealnym środkiem wirtualnej kanwy
+            cx = sum(p[0] for p in pts) / 4.0 + box.get("shift_x", 0)
+            cy = sum(p[1] for p in pts) / 4.0 + box.get("shift_y", 0)
 
-            # Matematyka justowania poziomego wzdłuż ramki
-            shift_align = 0
-            if box["alignment"] == "Lewo":
-                shift_align = - (box_w - txt_w) / 2.0
-            elif box["alignment"] == "Prawo":
-                shift_align = (box_w - txt_w) / 2.0
-
-            # Matematyka justowania pionowego (względem wysokości ramki tła)
-            shift_align_v = 0
-            if box.get("valign", "Środek") == "Góra":
-                shift_align_v = - (box_h - txt_h) / 2.0
-            elif box.get("valign", "Środek") == "Dół":
-                shift_align_v = (box_h - txt_h) / 2.0
-
-            rad = math.radians(angle)
-            dir_x = math.cos(rad)
-            dir_y = math.sin(rad)
-
-            # Wektor prostopadły (dla osi pionowej)
-            perp_x = -math.sin(rad)
-            perp_y = math.cos(rad)
-
-            cx = sum(p[0] for p in pts) / 4.0
-            cy = sum(p[1] for p in pts) / 4.0
-
-            final_cx = cx + (shift_align * dir_x) + (shift_align_v * perp_x) + box.get("shift_x", 0)
-            final_cy = cy + (shift_align * dir_y) + (shift_align_v * perp_y) + box.get("shift_y", 0)
-
-            paste_x = int(final_cx - rotated_txt_img.width / 2.0)
-            paste_y = int(final_cy - rotated_txt_img.height / 2.0)
+            paste_x = int(cx - rotated_txt_img.width / 2.0)
+            paste_y = int(cy - rotated_txt_img.height / 2.0)
 
             img_pil.paste(rotated_txt_img, (paste_x, paste_y), rotated_txt_img)
             img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)

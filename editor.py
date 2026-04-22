@@ -1,5 +1,6 @@
 import os
 import cv2
+import copy
 import tkinter as tk
 from tkinter import messagebox, ttk
 from PIL import Image, ImageTk, ImageDraw
@@ -7,6 +8,7 @@ import numpy as np
 import math
 import matplotlib.font_manager as fm
 from image_processor import ImageProcessor
+import uuid
 
 def get_system_fonts():
     font_map = {}
@@ -81,6 +83,9 @@ class EditorWindow:
 
         self.selected_box = None
         self.dragged_vertex_idx = None
+        self.dragged_box = False
+        self.drag_start_x = 0
+        self.drag_start_y = 0
 
         self.scale = 1.0
         self.base_scale = 1.0
@@ -97,6 +102,8 @@ class EditorWindow:
         self._is_updating_sidebar = False
 
         self.fast_delete_var = tk.BooleanVar(value=False)
+        self.clipboard_box = None
+        self.format_source_box = None
 
         self.process_all_images()
 
@@ -153,6 +160,8 @@ class EditorWindow:
             self.setup_ui()
             self.select_image(0, auto_scroll=True)
             root_win.bind("<Delete>", self.handle_delete_key)
+            root_win.bind("<Control-c>", self.copy_box)
+            root_win.bind("<Control-v>", self.paste_box)
         else:
             self.on_close()
 
@@ -171,7 +180,7 @@ class EditorWindow:
         self.canvas_zoom_slider.pack(side=tk.LEFT, padx=5, pady=2)
         tk.Button(self.canvas_zoom_frame, text="Reset", font=("Arial", 7), command=self.reset_zoom).pack(side=tk.LEFT, padx=2)
 
-        self.sidebar_container = tk.Frame(self.frame, width=320, bg="#f0f0f0")
+        self.sidebar_container = tk.Frame(self.frame, width=330, bg="#f0f0f0")
         self.sidebar_container.pack(side=tk.RIGHT, fill=tk.Y)
         self.sidebar_container.pack_propagate(False)
 
@@ -194,7 +203,7 @@ class EditorWindow:
         self.paned_window.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         self.top_pane = tk.Frame(self.paned_window, bg="#f0f0f0")
-        self.paned_window.add(self.top_pane, minsize=350, stretch="always")
+        self.paned_window.add(self.top_pane, minsize=400, stretch="always")
 
         self.tools_canvas = tk.Canvas(self.top_pane, bg="#f0f0f0", highlightthickness=0)
         self.tools_scrollbar = ttk.Scrollbar(self.top_pane, orient="vertical", command=self.tools_canvas.yview)
@@ -217,7 +226,12 @@ class EditorWindow:
         self.tools_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.tools_canvas.bind_all("<MouseWheel>", self._on_mousewheel_tools)
 
-        tk.Button(self.tools_inner, text="[+] Narysuj Wielokąt (LPM: punkt, PPM: zamknij)", command=self.toggle_draw_mode, bg="#FFC107").pack(fill=tk.X, pady=(0, 5))
+        # NARZĘDZIA
+        top_btn_frame = tk.Frame(self.tools_inner, bg="#f0f0f0")
+        top_btn_frame.pack(fill=tk.X, pady=(0, 5))
+        tk.Button(top_btn_frame, text="[+] Narysuj Wielokąt (LPM: punkt, PPM: zamknij)", command=self.toggle_draw_mode, bg="#FFC107").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.btn_format_painter = tk.Button(top_btn_frame, text="🖌️ Malarz Formatu", command=self.toggle_format_painter, bg="#e0e0e0")
+        self.btn_format_painter.pack(side=tk.RIGHT, padx=(5, 0))
 
         del_frame = tk.Frame(self.tools_inner, bg="#f0f0f0")
         del_frame.pack(fill=tk.X, pady=(0, 5))
@@ -247,7 +261,9 @@ class EditorWindow:
         tk.Label(fmt_frame, text="Font:", bg="#f0f0f0", font=("Arial", 8)).grid(row=0, column=0, sticky=tk.W)
         self.font_var = tk.StringVar(value="Arial - Regular")
         self.btn_font = ttk.Menubutton(fmt_frame, textvariable=self.font_var)
-        self.btn_font.grid(row=0, column=1, sticky=tk.EW, columnspan=3)
+        self.btn_font.grid(row=0, column=1, sticky=tk.EW, columnspan=2)
+
+        tk.Button(fmt_frame, text="[Wszędzie]", font=("Arial", 7), command=self.apply_font_everywhere).grid(row=0, column=3, padx=2)
 
         font_menu = tk.Menu(self.btn_font, tearoff=0)
         letters = sorted([k for k in GROUPED_FONTS.keys() if len(k) == 1])
@@ -345,6 +361,40 @@ class EditorWindow:
         self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_left_release)
         self.canvas.bind("<ButtonPress-3>", self.on_right_click)
+
+    def apply_font_everywhere(self):
+        if not self.selected_box: return
+        font = self.selected_box["font_family"]
+        for box in self.processor.boxes:
+            box["font_family"] = font
+        self.processor.image_changed = True
+        self.redraw_canvas()
+
+    def toggle_format_painter(self):
+        if not self.selected_box: return
+        if self.format_source_box:
+            self.format_source_box = None
+            self.btn_format_painter.config(bg="#e0e0e0")
+            self.canvas.config(cursor="cross")
+        else:
+            self.format_source_box = copy.deepcopy(self.selected_box)
+            self.btn_format_painter.config(bg="#4CAF50")
+            self.canvas.config(cursor="hand2")
+
+    def copy_box(self, event=None):
+        if self.selected_box:
+            self.clipboard_box = copy.deepcopy(self.selected_box)
+
+    def paste_box(self, event=None):
+        if hasattr(self, 'clipboard_box') and self.clipboard_box:
+            new_box = copy.deepcopy(self.clipboard_box)
+            new_box["id"] = str(uuid.uuid4())
+            new_box["points"] = [(p[0]+30, p[1]+30) for p in new_box["points"]]
+            self.processor.boxes.append(new_box)
+            self.selected_box = new_box
+            self.processor.image_changed = True
+            self.update_sidebar()
+            self.redraw_canvas()
 
     def handle_delete_key(self, event):
         focused = self.frame.focus_get()
@@ -505,7 +555,6 @@ class EditorWindow:
         canvas_w, canvas_h = self.canvas.winfo_width(), self.canvas.winfo_height()
         if canvas_w < 10 or canvas_h < 10: return
 
-        # KLUCZOWA POPRAWKA 1: Zapamiętanie flagi ZANIM get_rgb_image() ją zresetuje
         needs_pixel_update = self.processor.image_changed
 
         img_rgb = self.processor.get_rgb_image()
@@ -517,7 +566,6 @@ class EditorWindow:
         zoom_multiplier = self.canvas_zoom_var.get() / 100.0
         new_scale = self.base_scale * zoom_multiplier
 
-        # Aktualizujemy płótno, jeśli zmienił się zoom, pierwszy raz rysujemy, ALBO flaga zgłosiła zmianę
         if getattr(self, '_last_scale', None) != new_scale or needs_pixel_update or not hasattr(self, 'tk_img'):
             self.scale = new_scale
             new_w, new_h = int(img_w * self.scale), int(img_h * self.scale)
@@ -584,6 +632,30 @@ class EditorWindow:
             self.redraw_canvas()
             return
 
+        clicked_box = None
+        for box in reversed(self.processor.boxes):
+            if self.point_in_polygon((orig_x, orig_y), box["points"]):
+                clicked_box = box; break
+
+        # Malarz Formatu
+        if getattr(self, 'format_source_box', None) and clicked_box:
+            clicked_box["font_family"] = self.format_source_box["font_family"]
+            clicked_box["font_size"] = self.format_source_box["font_size"]
+            clicked_box["alignment"] = self.format_source_box["alignment"]
+            clicked_box["valign"] = self.format_source_box.get("valign", "Środek")
+            clicked_box["angle"] = self.format_source_box.get("angle", 0.0)
+            clicked_box["line_spacing"] = self.format_source_box.get("line_spacing", 2)
+
+            self.format_source_box = None
+            self.btn_format_painter.config(bg="#e0e0e0")
+            self.canvas.config(cursor="cross")
+
+            self.processor.image_changed = True
+            self.selected_box = clicked_box
+            self.update_sidebar()
+            self.redraw_canvas()
+            return
+
         if self.selected_box:
             for i, pt in enumerate(self.selected_box["points"]):
                 dist = math.hypot(pt[0] - orig_x, pt[1] - orig_y)
@@ -591,18 +663,14 @@ class EditorWindow:
                     self.dragged_vertex_idx = i
                     return
 
-        clicked_box = None
-        for box in reversed(self.processor.boxes):
-            if self.point_in_polygon((orig_x, orig_y), box["points"]):
-                clicked_box = box; break
-
-        if clicked_box != self.selected_box:
+        if clicked_box:
             self.selected_box = clicked_box
             self.update_sidebar()
+            self.canvas.focus_set()
+            self.dragged_box = True
+            self.drag_start_x = orig_x
+            self.drag_start_y = orig_y
             self.redraw_canvas()
-
-        # KLUCZOWA POPRAWKA 2: Przeniesienie focusu na canvas, by unikać auto-zaznaczania pola tekstowego
-        self.canvas.focus_set()
 
         if not clicked_box and self.dragged_vertex_idx is None:
             self.is_panning = True
@@ -619,6 +687,15 @@ class EditorWindow:
             self.selected_box["points"][self.dragged_vertex_idx] = (int(orig_x), int(orig_y))
             self.redraw_canvas()
 
+        elif getattr(self, 'dragged_box', False) and self.selected_box:
+            orig_x, orig_y = self.get_orig_coords(event.x, event.y)
+            dx = orig_x - self.drag_start_x
+            dy = orig_y - self.drag_start_y
+            self.selected_box["points"] = [(p[0]+dx, p[1]+dy) for p in self.selected_box["points"]]
+            self.drag_start_x = orig_x
+            self.drag_start_y = orig_y
+            self.redraw_canvas()
+
         elif getattr(self, 'is_panning', False):
             dx = event.x - self.pan_last_x
             dy = event.y - self.pan_last_y
@@ -631,6 +708,11 @@ class EditorWindow:
     def on_left_release(self, event):
         if self.dragged_vertex_idx is not None:
             self.dragged_vertex_idx = None
+            self.processor.image_changed = True
+            self.redraw_canvas()
+
+        if getattr(self, 'dragged_box', False):
+            self.dragged_box = False
             self.processor.image_changed = True
             self.redraw_canvas()
 
@@ -696,7 +778,6 @@ class EditorWindow:
                 state_mode = "readonly" if isinstance(w, ttk.Combobox) else "normal"
                 w.config(state=state_mode)
 
-            # USUNIĘTO auto-focus na text_new, by nie psuć skrótu DEL
         else:
             self.btn_delete.config(state="disabled")
             self.txt_original.config(state=tk.NORMAL)
@@ -710,32 +791,70 @@ class EditorWindow:
         self._is_updating_sidebar = False
 
     def auto_apply(self, event=None):
+        needs_pixel_update = False
         if getattr(self, "_is_updating_sidebar", False): return
 
         if self.selected_box:
             raw_text = self.text_new.get("1.0", tk.END)
             if raw_text.endswith('\n'): raw_text = raw_text[:-1]
 
-            self.selected_box["new_text"] = raw_text
-            self.selected_box["font_family"] = FONT_MAP.get(self.font_var.get(), "arial.ttf")
+            if self.selected_box["new_text"] != raw_text:
+                self.selected_box["new_text"] = raw_text
+                needs_pixel_update = True
 
-            try: self.selected_box["font_size"] = int(self.size_var.get())
-            except ValueError: pass
-            try: self.selected_box["angle"] = float(self.angle_var.get())
-            except ValueError: pass
-            try: self.selected_box["line_spacing"] = int(self.spacing_var.get())
-            except ValueError: pass
-            try: self.selected_box["shift_x"] = int(self.shift_x_var.get())
-            except ValueError: pass
-            try: self.selected_box["shift_y"] = int(self.shift_y_var.get())
+            font = FONT_MAP.get(self.font_var.get(), "arial.ttf")
+            if self.selected_box["font_family"] != font:
+                self.selected_box["font_family"] = font
+                needs_pixel_update = True
+
+            try:
+                v = int(self.size_var.get())
+                if self.selected_box["font_size"] != v:
+                    self.selected_box["font_size"] = v
+                    needs_pixel_update = True
             except ValueError: pass
 
-            self.selected_box["alignment"] = self.align_var.get()
-            self.selected_box["valign"] = self.valign_var.get()
+            try:
+                v = float(self.angle_var.get())
+                if self.selected_box.get("angle", 0) != v:
+                    self.selected_box["angle"] = v
+                    needs_pixel_update = True
+            except ValueError: pass
+
+            try:
+                v = int(self.spacing_var.get())
+                if self.selected_box.get("line_spacing", 2) != v:
+                    self.selected_box["line_spacing"] = v
+                    needs_pixel_update = True
+            except ValueError: pass
+
+            try:
+                v = int(self.shift_x_var.get())
+                if self.selected_box.get("shift_x", 0) != v:
+                    self.selected_box["shift_x"] = v
+                    needs_pixel_update = True
+            except ValueError: pass
+
+            try:
+                v = int(self.shift_y_var.get())
+                if self.selected_box.get("shift_y", 0) != v:
+                    self.selected_box["shift_y"] = v
+                    needs_pixel_update = True
+            except ValueError: pass
+
+            if self.selected_box["alignment"] != self.align_var.get():
+                self.selected_box["alignment"] = self.align_var.get()
+                needs_pixel_update = True
+
+            if self.selected_box.get("valign", "Środek") != self.valign_var.get():
+                self.selected_box["valign"] = self.valign_var.get()
+                needs_pixel_update = True
+
             self.selected_box["ignored"] = False
 
-            self.processor.image_changed = True
-            self.redraw_canvas()
+            if needs_pixel_update:
+                self.processor.image_changed = True
+                self.redraw_canvas()
 
     def ignore_box(self):
         if self.selected_box:
