@@ -1,6 +1,9 @@
 import os
 import cv2
 import copy
+import uuid
+import zipfile
+from tkinter import filedialog
 import tkinter as tk
 from tkinter import messagebox, ttk
 from PIL import Image, ImageTk, ImageDraw
@@ -8,7 +11,38 @@ import numpy as np
 import math
 import matplotlib.font_manager as fm
 from image_processor import ImageProcessor
-import uuid
+
+class ConflictDialog(tk.Toplevel):
+    def __init__(self, parent, filename):
+        super().__init__(parent)
+        self.title("Konflikt plików")
+        self.geometry("380x160")
+        self.choice = "skip"
+        self.apply_to_all = False
+
+        tk.Label(self, text=f"Plik '{filename}' już istnieje w tym folderze.\nWybierz co zrobić:", justify=tk.CENTER).pack(pady=10)
+
+        btn_frame = tk.Frame(self)
+        btn_frame.pack(pady=5)
+        tk.Button(btn_frame, text="Zastąp", width=10, command=lambda: self.set_choice("replace")).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Pomiń", width=10, command=lambda: self.set_choice("skip")).pack(side=tk.LEFT, padx=5)
+        tk.Button(btn_frame, text="Zmień nazwę", width=12, command=lambda: self.set_choice("keep")).pack(side=tk.LEFT, padx=5)
+
+        self.check_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(self, text="Zastosuj tę decyzję do wszystkich konfliktów", variable=self.check_var).pack(pady=10)
+
+        self.transient(parent)
+        self.grab_set()
+
+        parent.update_idletasks()
+        x = parent.winfo_x() + (parent.winfo_width() // 2) - 190
+        y = parent.winfo_y() + (parent.winfo_height() // 2) - 80
+        self.geometry(f"+{x}+{y}")
+
+    def set_choice(self, choice):
+        self.choice = choice
+        self.apply_to_all = self.check_var.get()
+        self.destroy()
 
 def get_system_fonts():
     font_map = {}
@@ -62,17 +96,24 @@ def get_system_fonts():
 FONT_MAP, GROUPED_FONTS = get_system_fonts()
 
 class EditorWindow:
-    def __init__(self, parent_frame, input_dir, engine, auto_translate, on_close_callback):
+    def __init__(self, parent_frame, input_dir, engine, auto_translate, on_close_callback, original_zip_path=None):
         self.frame = parent_frame
         self.input_dir = input_dir
         self.engine = engine
         self.auto_translate = auto_translate
         self.on_close = on_close_callback
+        self.original_zip_path = original_zip_path
 
         self.output_dir = os.path.join(input_dir, "przetlumaczone")
-        if not os.path.exists(self.output_dir): os.makedirs(self.output_dir)
+        if not self.original_zip_path and not os.path.exists(self.output_dir):
+            os.makedirs(self.output_dir)
 
-        self.image_files = [f for f in os.listdir(input_dir) if f.lower().endswith(('.tif', '.png', '.jpg'))]
+        self.image_files = []
+        for root_dir, _, files in os.walk(input_dir):
+            for f in files:
+                if f.lower().endswith(('.tif', '.png', '.jpg', '.jpeg')):
+                    self.image_files.append(os.path.relpath(os.path.join(root_dir, f), input_dir))
+
         self.current_index = 0
 
         self.processors = {}
@@ -99,17 +140,23 @@ class EditorWindow:
 
         self.drawing_poly_mode = False
         self.current_poly_points = []
-        self._is_updating_sidebar = False
+        self.drawing_rect_mode = False
+        self.temp_lines = []
 
+        self._is_updating_sidebar = False
+        self._typing_timer = None
         self.fast_delete_var = tk.BooleanVar(value=False)
         self.clipboard_box = None
         self.format_source_box = None
+
+        self.last_font_size = 24
+        self.last_line_spacing = 2
 
         self.process_all_images()
 
     def process_all_images(self):
         if not self.image_files:
-            messagebox.showinfo("Informacja", "Brak obrazków w wybranym folderze.")
+            messagebox.showinfo("Informacja", "Brak obrazków we wskazanym źródle.")
             self.on_close()
             return
 
@@ -162,6 +209,8 @@ class EditorWindow:
             root_win.bind("<Delete>", self.handle_delete_key)
             root_win.bind("<Control-c>", self.copy_box)
             root_win.bind("<Control-v>", self.paste_box)
+            root_win.bind("<v>", self.handle_v_key)
+            root_win.bind("<V>", self.handle_v_key)
         else:
             self.on_close()
 
@@ -170,17 +219,35 @@ class EditorWindow:
 
         self.canvas = tk.Canvas(self.frame, cursor="cross", bg="#333333")
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        # Bindowanie scrolla dla zoomowania z poziomu Canvas
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel_canvas)
 
         self.canvas_zoom_frame = tk.Frame(self.frame, bg="#e0e0e0", bd=1, relief=tk.RAISED)
         self.canvas_zoom_frame.place(relx=0.0, rely=1.0, anchor='sw', x=10, y=-10)
 
-        tk.Label(self.canvas_zoom_frame, text="Powiększenie obrazu:", bg="#e0e0e0", font=("Arial", 8)).pack(side=tk.LEFT, padx=5)
-        self.canvas_zoom_var = tk.DoubleVar(value=100.0)
-        self.canvas_zoom_slider = ttk.Scale(self.canvas_zoom_frame, from_=20, to=500, orient=tk.HORIZONTAL, variable=self.canvas_zoom_var, command=lambda e: self.redraw_canvas())
-        self.canvas_zoom_slider.pack(side=tk.LEFT, padx=5, pady=2)
-        tk.Button(self.canvas_zoom_frame, text="Reset", font=("Arial", 7), command=self.reset_zoom).pack(side=tk.LEFT, padx=2)
+        top_ctrl_frame = tk.Frame(self.canvas_zoom_frame, bg="#e0e0e0")
+        top_ctrl_frame.pack(side=tk.TOP, fill=tk.X, padx=5, pady=(5,0))
 
-        self.sidebar_container = tk.Frame(self.frame, width=330, bg="#f0f0f0")
+        tk.Label(top_ctrl_frame, text="Krycie zazn. pola:", bg="#e0e0e0", font=("Arial", 8)).pack(side=tk.LEFT)
+        self.alpha_var = tk.DoubleVar(value=100.0)
+        self.alpha_slider = ttk.Scale(top_ctrl_frame, from_=0, to=100, orient=tk.HORIZONTAL, variable=self.alpha_var, command=self.on_alpha_slide)
+        self.alpha_slider.pack(side=tk.LEFT, padx=(2, 10))
+
+        self.show_text_var = tk.BooleanVar(value=True)
+        self.show_boxes_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(top_ctrl_frame, text="Podgląd tłumaczenia", variable=self.show_text_var, command=self.toggle_text_preview, bg="#e0e0e0", font=("Arial", 8)).pack(side=tk.LEFT, padx=5)
+        tk.Checkbutton(top_ctrl_frame, text="Pokaż ramki", variable=self.show_boxes_var, command=self.redraw_canvas, bg="#e0e0e0", font=("Arial", 8)).pack(side=tk.LEFT, padx=5)
+
+        bot_ctrl_frame = tk.Frame(self.canvas_zoom_frame, bg="#e0e0e0")
+        bot_ctrl_frame.pack(side=tk.BOTTOM, fill=tk.X, padx=5, pady=(2,5))
+
+        tk.Label(bot_ctrl_frame, text="Powiększenie obrazu:", bg="#e0e0e0", font=("Arial", 8)).pack(side=tk.LEFT)
+        self.canvas_zoom_var = tk.DoubleVar(value=100.0)
+        self.canvas_zoom_slider = ttk.Scale(bot_ctrl_frame, from_=20, to=500, orient=tk.HORIZONTAL, variable=self.canvas_zoom_var, command=lambda e: self.redraw_canvas())
+        self.canvas_zoom_slider.pack(side=tk.LEFT, padx=(2, 10))
+        tk.Button(bot_ctrl_frame, text="Reset", font=("Arial", 7), command=self.reset_zoom).pack(side=tk.LEFT)
+
+        self.sidebar_container = tk.Frame(self.frame, width=340, bg="#f0f0f0")
         self.sidebar_container.pack(side=tk.RIGHT, fill=tk.Y)
         self.sidebar_container.pack_propagate(False)
 
@@ -226,12 +293,20 @@ class EditorWindow:
         self.tools_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.tools_canvas.bind_all("<MouseWheel>", self._on_mousewheel_tools)
 
-        # NARZĘDZIA
         top_btn_frame = tk.Frame(self.tools_inner, bg="#f0f0f0")
         top_btn_frame.pack(fill=tk.X, pady=(0, 5))
-        tk.Button(top_btn_frame, text="[+] Narysuj Wielokąt (LPM: punkt, PPM: zamknij)", command=self.toggle_draw_mode, bg="#FFC107").pack(side=tk.LEFT, fill=tk.X, expand=True)
-        self.btn_format_painter = tk.Button(top_btn_frame, text="🖌️ Malarz Formatu", command=self.toggle_format_painter, bg="#e0e0e0")
-        self.btn_format_painter.pack(side=tk.RIGHT, padx=(5, 0))
+        self.btn_format_painter = tk.Button(top_btn_frame, text="🖌️ Malarz Formatu (V)", command=self.toggle_format_painter, bg="#e0e0e0")
+        self.btn_format_painter.pack(fill=tk.X)
+
+        draw_btn_frame = tk.Frame(self.tools_inner, bg="#f0f0f0")
+        draw_btn_frame.pack(fill=tk.X, pady=(0, 5))
+        self.btn_draw_rect = tk.Button(draw_btn_frame, text="[+] Prostokąt", command=self.toggle_draw_rect_mode, bg="#FFC107")
+        self.btn_draw_rect.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        self.btn_draw = tk.Button(draw_btn_frame, text="[+] Wielokąt", command=self.toggle_draw_mode, bg="#FFC107")
+        self.btn_draw.pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(2, 0))
+
+        self.approx_poly_var = tk.BooleanVar(value=True)
+        tk.Checkbutton(self.tools_inner, text="Aproksymuj wielokąt do prostokąta", variable=self.approx_poly_var, bg="#f0f0f0", font=("Arial", 8)).pack(anchor=tk.W, pady=(0, 5))
 
         del_frame = tk.Frame(self.tools_inner, bg="#f0f0f0")
         del_frame.pack(fill=tk.X, pady=(0, 5))
@@ -253,7 +328,7 @@ class EditorWindow:
 
         self.text_new = tk.Text(self.tools_inner, font=("Arial", 11), height=4)
         self.text_new.pack(fill=tk.X, pady=(0, 5))
-        self.text_new.bind("<KeyRelease>", self.auto_apply)
+        self.text_new.bind("<KeyRelease>", self.on_key_release)
 
         fmt_frame = tk.LabelFrame(self.tools_inner, text="Ustawienia", bg="#f0f0f0", padx=5, pady=2)
         fmt_frame.pack(fill=tk.X, pady=2)
@@ -362,6 +437,38 @@ class EditorWindow:
         self.canvas.bind("<ButtonRelease-1>", self.on_left_release)
         self.canvas.bind("<ButtonPress-3>", self.on_right_click)
 
+    def on_key_release(self, event):
+        if self._typing_timer:
+            self.frame.after_cancel(self._typing_timer)
+        self._typing_timer = self.frame.after(250, self.auto_apply)
+
+    def _set_selected_box(self, box):
+        changed = (self.selected_box != box)
+        self.selected_box = box
+        if hasattr(self, 'processor') and self.processor:
+            self.processor.selected_box_id = box["id"] if box else None
+            if changed and self.alpha_var.get() < 100.0:
+                self.processor.image_changed = True
+
+    def on_alpha_slide(self, event=None):
+        if hasattr(self, 'processor') and self.processor:
+            self.processor.selected_alpha = self.alpha_var.get() / 100.0
+            if self.selected_box:
+                self.processor.image_changed = True
+                self.redraw_canvas()
+
+    def toggle_text_preview(self):
+        if hasattr(self, 'processor') and self.processor:
+            self.processor.show_replacement_text = self.show_text_var.get()
+            self.processor.image_changed = True
+            self.redraw_canvas()
+
+    def handle_v_key(self, event):
+        focused = self.frame.focus_get()
+        if isinstance(focused, (tk.Text, tk.Entry, tk.Spinbox, ttk.Spinbox, ttk.Combobox)):
+            return
+        self.toggle_format_painter()
+
     def apply_font_everywhere(self):
         if not self.selected_box: return
         font = self.selected_box["font_family"]
@@ -372,7 +479,7 @@ class EditorWindow:
 
     def toggle_format_painter(self):
         if not self.selected_box: return
-        if self.format_source_box:
+        if getattr(self, 'format_source_box', None):
             self.format_source_box = None
             self.btn_format_painter.config(bg="#e0e0e0")
             self.canvas.config(cursor="cross")
@@ -391,7 +498,7 @@ class EditorWindow:
             new_box["id"] = str(uuid.uuid4())
             new_box["points"] = [(p[0]+30, p[1]+30) for p in new_box["points"]]
             self.processor.boxes.append(new_box)
-            self.selected_box = new_box
+            self._set_selected_box(new_box)
             self.processor.image_changed = True
             self.update_sidebar()
             self.redraw_canvas()
@@ -408,6 +515,13 @@ class EditorWindow:
         self.canvas_zoom_var.set(100.0)
         self.pan_offset_x = 0
         self.pan_offset_y = 0
+        self.redraw_canvas()
+
+    def _on_mousewheel_canvas(self, event):
+        factor = 1.1 if event.delta > 0 else 0.9
+        new_val = self.canvas_zoom_var.get() * factor
+        new_val = max(20, min(new_val, 500))
+        self.canvas_zoom_var.set(new_val)
         self.redraw_canvas()
 
     def _on_mousewheel_tools(self, event):
@@ -491,8 +605,13 @@ class EditorWindow:
         self.frame.master.title(f"Edytor - {filename} ({self.current_index + 1}/{len(self.image_files)})")
 
         self.processor = self.processors[filename]
-        self.selected_box = None
-        if self.drawing_poly_mode: self.toggle_draw_mode()
+        self._set_selected_box(None)
+
+        if self.processor:
+            self.processor.selected_alpha = self.alpha_var.get() / 100.0
+
+        if getattr(self, 'drawing_poly_mode', False): self.toggle_draw_mode()
+        if getattr(self, 'drawing_rect_mode', False): self.toggle_draw_rect_mode()
 
         self.canvas_zoom_var.set(100.0)
         self.pan_offset_x = 0
@@ -507,15 +626,79 @@ class EditorWindow:
 
     def export_current(self):
         filename = self.image_files[self.current_index]
-        out_path = os.path.join(self.output_dir, filename)
-        self.processor.save(out_path)
-        messagebox.showinfo("Zapisano", f"Pomyślnie wyeksportowano bieżący plik:\n{filename}")
+        default_name = os.path.basename(filename)
+        out_path = filedialog.asksaveasfilename(
+            title="Zapisz bieżący obraz",
+            initialfile=default_name,
+            defaultextension=os.path.splitext(default_name)[1]
+        )
+        if out_path:
+            self.processor.save(out_path)
+            messagebox.showinfo("Zapisano", f"Pomyślnie wyeksportowano bieżący plik:\n{out_path}")
 
     def export_all(self):
-        for filename, proc in self.processors.items():
-            out_path = os.path.join(self.output_dir, filename)
-            proc.save(out_path)
-        messagebox.showinfo("Zapisano", f"Sukces! Wyeksportowano wszystkie pliki ({len(self.processors)}) do folderu:\n{self.output_dir}")
+        if self.original_zip_path:
+            save_path = filedialog.asksaveasfilename(
+                title="Zapisz nowy plik ZIP",
+                defaultextension=".zip",
+                filetypes=[("Pliki ZIP", "*.zip")],
+                initialfile="przetlumaczone_" + os.path.basename(self.original_zip_path)
+            )
+            if not save_path: return
+
+            with zipfile.ZipFile(self.original_zip_path, 'r') as zin:
+                with zipfile.ZipFile(save_path, 'w', compression=zipfile.ZIP_DEFLATED) as zout:
+                    rel_paths_fwd = {p.replace('\\', '/'): p for p in self.processors.keys()}
+                    for item in zin.infolist():
+                        zip_path = item.filename
+                        if zip_path.endswith('/'): continue
+                        if zip_path in rel_paths_fwd:
+                            rel_p = rel_paths_fwd[zip_path]
+                            proc = self.processors[rel_p]
+                            proc.apply_all_edits()
+                            ext = os.path.splitext(rel_p)[1]
+                            is_success, im_buf_arr = cv2.imencode(ext, proc.current_cv_image)
+                            if is_success:
+                                zout.writestr(item, im_buf_arr.tobytes())
+                            else:
+                                zout.writestr(item, zin.read(item.filename))
+                        else:
+                            zout.writestr(item, zin.read(item.filename))
+            messagebox.showinfo("Zapisano", f"Pomyślnie utworzono nowy ZIP:\n{save_path}")
+        else:
+            out_dir = filedialog.askdirectory(title="Wybierz folder docelowy dla wszystkich zdjęć")
+            if not out_dir: return
+
+            apply_to_all_choice = None
+            saved_count = 0
+
+            for filename, proc in self.processors.items():
+                dest_path = os.path.join(out_dir, filename)
+                os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+
+                if os.path.exists(dest_path):
+                    if apply_to_all_choice:
+                        choice = apply_to_all_choice
+                    else:
+                        dialog = ConflictDialog(self.frame.winfo_toplevel(), os.path.basename(filename))
+                        self.frame.wait_window(dialog)
+                        choice = dialog.choice
+                        if dialog.apply_to_all:
+                            apply_to_all_choice = choice
+
+                    if choice == "skip":
+                        continue
+                    elif choice == "keep":
+                        base, ext = os.path.splitext(dest_path)
+                        counter = 1
+                        while os.path.exists(f"{base} ({counter}){ext}"):
+                            counter += 1
+                        dest_path = f"{base} ({counter}){ext}"
+
+                proc.save(dest_path)
+                saved_count += 1
+
+            messagebox.showinfo("Zapisano", f"Eksport zakończony!\nZapisano {saved_count} plików do:\n{out_dir}")
 
     def change_font(self, unique_font_name):
         if self._is_updating_sidebar: return
@@ -536,17 +719,37 @@ class EditorWindow:
             self.text_new.mark_set(tk.INSERT, f"{tk.INSERT}-1c")
         self.auto_apply()
 
-    def toggle_draw_mode(self):
-        self.drawing_poly_mode = not self.drawing_poly_mode
-        self.current_poly_points = []
-        if self.drawing_poly_mode:
-            self.btn_draw.config(bg="#4CAF50", text="[Trwa rysowanie...]")
+    def toggle_draw_rect_mode(self):
+        self.drawing_rect_mode = not getattr(self, 'drawing_rect_mode', False)
+        if self.drawing_rect_mode:
+            if self.drawing_poly_mode: self.toggle_draw_mode()
+            self.btn_draw_rect.config(bg="#4CAF50", text="[Trwa rysowanie...]")
             self.canvas.config(cursor="crosshair")
-            self.selected_box = None
+            self._set_selected_box(None)
             self.update_sidebar()
             self.redraw_canvas()
         else:
-            self.btn_draw.config(bg="#FFC107", text="[+] Narysuj Wielokąt")
+            self.btn_draw_rect.config(bg="#FFC107", text="[+] Prostokąt")
+            self.canvas.config(cursor="cross")
+            self.canvas.delete("temp_rect")
+            self.redraw_canvas()
+
+    def toggle_draw_mode(self):
+        self.drawing_poly_mode = not getattr(self, 'drawing_poly_mode', False)
+        self.current_poly_points = []
+        for line in getattr(self, 'temp_lines', []):
+            self.canvas.delete(line)
+        self.temp_lines = []
+
+        if self.drawing_poly_mode:
+            if getattr(self, 'drawing_rect_mode', False): self.toggle_draw_rect_mode()
+            self.btn_draw.config(bg="#4CAF50", text="[Trwa rysowanie...]")
+            self.canvas.config(cursor="crosshair")
+            self._set_selected_box(None)
+            self.update_sidebar()
+            self.redraw_canvas()
+        else:
+            self.btn_draw.config(bg="#FFC107", text="[+] Wielokąt")
             self.canvas.config(cursor="cross")
             self.redraw_canvas()
 
@@ -571,10 +774,10 @@ class EditorWindow:
             new_w, new_h = int(img_w * self.scale), int(img_h * self.scale)
             if new_w > 10000 or new_h > 10000: return
 
-            orig_pil = Image.fromarray(img_rgb)
-            resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
-            resized_img = orig_pil.resize((new_w, new_h), resample)
-            self.tk_img = ImageTk.PhotoImage(resized_img)
+            # Użycie OpenCV dla błyskawicznego skalowania!
+            resized_cv = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+            self.tk_img = ImageTk.PhotoImage(image=Image.fromarray(resized_cv))
+
             self._last_scale = self.scale
             self._last_w, self._last_h = new_w, new_h
 
@@ -586,27 +789,30 @@ class EditorWindow:
         self.canvas.delete("all")
         self.canvas.create_image(self.offset_x, self.offset_y, anchor=tk.NW, image=self.tk_img)
 
-        for box in self.processor.boxes:
-            color = "#00FF00" if box == self.selected_box else ("gray" if box["ignored"] else ("#FFA500" if box["new_text"] is not None else "red"))
-            scaled_pts = [(int(p[0]*self.scale) + self.offset_x, int(p[1]*self.scale) + self.offset_y) for p in box["points"]]
+        show_boxes = self.show_boxes_var.get()
 
-            flat_pts = [coord for pt in scaled_pts for coord in pt]
-            if len(scaled_pts) > 2:
-                self.canvas.create_polygon(flat_pts, outline=color, fill="", width=2)
-            elif len(scaled_pts) == 2:
-                self.canvas.create_line(flat_pts, fill=color, width=2)
+        if show_boxes:
+            for box in self.processor.boxes:
+                color = "#00FF00" if box == self.selected_box else ("gray" if box["ignored"] else ("#FFA500" if box["new_text"] is not None else "red"))
+                scaled_pts = [(int(p[0]*self.scale) + self.offset_x, int(p[1]*self.scale) + self.offset_y) for p in box["points"]]
 
-        if self.selected_box:
-            for pt in self.selected_box["points"]:
-                px, py = int(pt[0]*self.scale) + self.offset_x, int(pt[1]*self.scale) + self.offset_y
-                self.canvas.create_rectangle(px-4, py-4, px+4, py+4, fill="#2196F3", outline="white", width=1)
+                flat_pts = [coord for pt in scaled_pts for coord in pt]
+                if len(scaled_pts) > 2:
+                    self.canvas.create_polygon(flat_pts, outline=color, fill="", width=2)
+                elif len(scaled_pts) == 2:
+                    self.canvas.create_line(flat_pts, fill=color, width=2)
 
-        if self.drawing_poly_mode and len(self.current_poly_points) > 0:
+            if self.selected_box:
+                for pt in self.selected_box["points"]:
+                    px, py = int(pt[0]*self.scale) + self.offset_x, int(pt[1]*self.scale) + self.offset_y
+                    self.canvas.create_rectangle(px-4, py-4, px+4, py+4, fill="magenta", outline="white", width=1)
+
+        if getattr(self, 'drawing_poly_mode', False) and len(self.current_poly_points) > 0:
             for i in range(len(self.current_poly_points) - 1):
                 p1, p2 = self.current_poly_points[i], self.current_poly_points[i+1]
                 x1, y1 = p1[0]*self.scale + self.offset_x, p1[1]*self.scale + self.offset_y
                 x2, y2 = p2[0]*self.scale + self.offset_x, p2[1]*self.scale + self.offset_y
-                self.canvas.create_line(x1, y1, x2, y2, fill="yellow", width=2)
+                self.canvas.create_line(x1, y1, x2, y2, fill="magenta", width=2)
 
     def get_orig_coords(self, event_x, event_y):
         return (event_x - self.offset_x) / self.scale, (event_y - self.offset_y) / self.scale
@@ -615,6 +821,7 @@ class EditorWindow:
         x, y = pt
         n = len(poly)
         inside = False
+        if n == 0: return False
         p1x, p1y = poly[0]
         for i in range(n + 1):
             p2x, p2y = poly[i % n]
@@ -627,7 +834,12 @@ class EditorWindow:
     def on_left_click(self, event):
         orig_x, orig_y = self.get_orig_coords(event.x, event.y)
 
-        if self.drawing_poly_mode:
+        if getattr(self, 'drawing_rect_mode', False):
+            self.rect_start_x = orig_x
+            self.rect_start_y = orig_y
+            return
+
+        if getattr(self, 'drawing_poly_mode', False):
             self.current_poly_points.append((orig_x, orig_y))
             self.redraw_canvas()
             return
@@ -637,7 +849,6 @@ class EditorWindow:
             if self.point_in_polygon((orig_x, orig_y), box["points"]):
                 clicked_box = box; break
 
-        # Malarz Formatu
         if getattr(self, 'format_source_box', None) and clicked_box:
             clicked_box["font_family"] = self.format_source_box["font_family"]
             clicked_box["font_size"] = self.format_source_box["font_size"]
@@ -651,7 +862,7 @@ class EditorWindow:
             self.canvas.config(cursor="cross")
 
             self.processor.image_changed = True
-            self.selected_box = clicked_box
+            self._set_selected_box(clicked_box)
             self.update_sidebar()
             self.redraw_canvas()
             return
@@ -664,12 +875,16 @@ class EditorWindow:
                     return
 
         if clicked_box:
-            self.selected_box = clicked_box
+            self._set_selected_box(clicked_box)
             self.update_sidebar()
             self.canvas.focus_set()
             self.dragged_box = True
             self.drag_start_x = orig_x
             self.drag_start_y = orig_y
+            self.redraw_canvas()
+        else:
+            self._set_selected_box(None)
+            self.update_sidebar()
             self.redraw_canvas()
 
         if not clicked_box and self.dragged_vertex_idx is None:
@@ -679,6 +894,13 @@ class EditorWindow:
             self.canvas.config(cursor="fleur")
 
     def on_mouse_drag(self, event):
+        if getattr(self, 'drawing_rect_mode', False) and hasattr(self, 'rect_start_x'):
+            self.canvas.delete("temp_rect")
+            px1, py1 = self.rect_start_x * self.scale + self.offset_x, self.rect_start_y * self.scale + self.offset_y
+            px2, py2 = event.x, event.y
+            self.canvas.create_rectangle(px1, py1, px2, py2, outline="magenta", width=2, tags="temp_rect")
+            return
+
         if self.dragged_vertex_idx is not None and self.selected_box:
             orig_x, orig_y = self.get_orig_coords(event.x, event.y)
             h_img, w_img = self.processor.original_cv_image.shape[:2]
@@ -706,6 +928,23 @@ class EditorWindow:
             self.redraw_canvas()
 
     def on_left_release(self, event):
+        if getattr(self, 'drawing_rect_mode', False) and hasattr(self, 'rect_start_x'):
+            orig_x, orig_y = self.get_orig_coords(event.x, event.y)
+            if abs(orig_x - self.rect_start_x) > 5 and abs(orig_y - self.rect_start_y) > 5:
+                new_box = self.processor.add_manual_rectangle(self.rect_start_x, self.rect_start_y, orig_x, orig_y)
+                new_box["font_family"] = FONT_MAP.get(self.font_var.get(), "arial.ttf")
+                new_box["font_size"] = self.last_font_size
+                new_box["line_spacing"] = self.last_line_spacing
+                new_box["alignment"] = "Środek"
+                new_box["valign"] = "Środek"
+                self._set_selected_box(new_box)
+
+            self.canvas.delete("temp_rect")
+            self.toggle_draw_rect_mode()
+            self.update_sidebar()
+            self.redraw_canvas()
+            return
+
         if self.dragged_vertex_idx is not None:
             self.dragged_vertex_idx = None
             self.processor.image_changed = True
@@ -721,17 +960,27 @@ class EditorWindow:
             self.canvas.config(cursor="cross")
 
     def on_right_click(self, event):
-        if self.drawing_poly_mode and len(self.current_poly_points) > 2:
-            new_box = self.processor.add_manual_polygon(self.current_poly_points)
-            self.selected_box = new_box
+        if getattr(self, 'drawing_poly_mode', False) and len(self.current_poly_points) > 2:
+            approx = self.approx_poly_var.get()
+            new_box = self.processor.add_manual_polygon(self.current_poly_points, approximate=approx)
+
+            new_box["font_family"] = FONT_MAP.get(self.font_var.get(), "arial.ttf")
+            new_box["font_size"] = self.last_font_size
+            new_box["line_spacing"] = self.last_line_spacing
+            new_box["alignment"] = "Środek"
+            new_box["valign"] = "Środek"
+
+            self.processor.image_changed = True
+            self._set_selected_box(new_box)
             self.toggle_draw_mode()
             self.update_sidebar()
             self.redraw_canvas()
+            self.canvas.update()
 
     def delete_current_box(self):
         if self.selected_box:
             self.processor.delete_box(self.selected_box["id"])
-            self.selected_box = None
+            self._set_selected_box(None)
             self.update_sidebar()
             self.redraw_canvas()
 
@@ -811,6 +1060,7 @@ class EditorWindow:
                 v = int(self.size_var.get())
                 if self.selected_box["font_size"] != v:
                     self.selected_box["font_size"] = v
+                    self.last_font_size = v
                     needs_pixel_update = True
             except ValueError: pass
 
@@ -825,6 +1075,7 @@ class EditorWindow:
                 v = int(self.spacing_var.get())
                 if self.selected_box.get("line_spacing", 2) != v:
                     self.selected_box["line_spacing"] = v
+                    self.last_line_spacing = v
                     needs_pixel_update = True
             except ValueError: pass
 

@@ -1,6 +1,7 @@
 import os
 os.environ["FLAGS_enable_pir_api"] = "0"
 os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE" # Zabezpieczenie przed błędem libiomp5md.dll
 
 import cv2
 import pytesseract
@@ -22,7 +23,7 @@ TRANSLATION_FIXES = {
 }
 
 class ImageProcessor:
-    def __init__(self, image_path, engine="tesseract", auto_translate=False):
+    def __init__(self, image_path, engine="none", auto_translate=False):
         self.image_path = image_path
         self.engine = engine
         self.auto_translate = auto_translate
@@ -42,6 +43,10 @@ class ImageProcessor:
 
         self.image_changed = True
         self._cached_rgb = None
+        self.show_replacement_text = True
+
+        self.selected_box_id = None
+        self.selected_alpha = 1.0
 
     def _strip_punctuation(self, text):
         return ''.join(c for c in text if c.isalnum()).lower()
@@ -99,6 +104,10 @@ class ImageProcessor:
 
     def detect_text(self):
         self.boxes = []
+        if self.engine == "none":
+            self.image_changed = True
+            return self.boxes
+
         gray = cv2.cvtColor(self.original_cv_image, cv2.COLOR_BGR2GRAY)
         global _GLOBAL_PADDLE_READER
 
@@ -135,7 +144,7 @@ class ImageProcessor:
                     pts, angle = self._regularize_box(pts)
                     self._append_box(pts, text, angle)
 
-        else: # Tesseract
+        else:
             _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
             d = pytesseract.image_to_data(thresh, config='--oem 3 --psm 11', output_type=pytesseract.Output.DICT)
             for i in range(len(d['text'])):
@@ -190,28 +199,76 @@ class ImageProcessor:
             "shift_x": 0, "shift_y": 0
         })
 
-    def add_manual_polygon(self, pts):
-        pts_array = np.array(pts, dtype=np.int32)
-        x, y, w, h = cv2.boundingRect(pts_array)
-        rect_pts = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
-        angle = 0.0
+    def add_manual_rectangle(self, x1, y1, x2, y2):
+        x, y = min(x1, x2), min(y1, y2)
+        w, h = abs(x2 - x1), abs(y2 - y1)
+        raw_pts = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
+
+        final_pts, angle = self._regularize_box(raw_pts)
 
         mask = np.zeros(self.original_cv_image.shape[:2], dtype=np.uint8)
-        cv2.fillPoly(mask, [np.array(rect_pts)], 255)
+        cv2.fillPoly(mask, [np.array(final_pts, dtype=np.int32)], 255)
         masked_img = cv2.bitwise_and(self.original_cv_image, self.original_cv_image, mask=mask)
 
         detected_text = "[Pole Niestandardowe]"
         if self.engine == "easyocr" and self.easyocr_reader:
             res = self.easyocr_reader.readtext(masked_img)
             if res: detected_text = " ".join([r[1] for r in res])
-        else:
+        elif self.engine != "none":
             text = pytesseract.image_to_string(masked_img, config=r'--psm 3').strip()
             if text: detected_text = text
 
-        h_est = max(10, int(h * 0.8))
+        rect = cv2.boundingRect(np.array(final_pts, dtype=np.int32))
+        h_est = max(10, int(rect[3] * 0.8) if angle == 0 else int(rect[2] * 0.8))
+
         new_box = {
             "id": str(uuid.uuid4()),
-            "points": rect_pts,
+            "points": final_pts,
+            "angle": angle,
+            "original_text": detected_text,
+            "translated_text": None,
+            "new_text": None,
+            "ignored": False,
+            "font_family": "arial.ttf",
+            "font_size": h_est,
+            "alignment": "Środek",
+            "valign": "Środek",
+            "line_spacing": 2,
+            "shift_x": 0, "shift_y": 0
+        }
+        self.boxes.append(new_box)
+        self.image_changed = True
+        return new_box
+
+    def add_manual_polygon(self, pts, approximate=False):
+        pts_array = np.array(pts, dtype=np.int32)
+
+        if approximate:
+            x, y, w, h = cv2.boundingRect(pts_array)
+            raw_pts = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
+            final_pts, angle = self._regularize_box(raw_pts)
+        else:
+            final_pts = pts
+            angle = 0.0
+
+        mask = np.zeros(self.original_cv_image.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(mask, [np.array(final_pts, dtype=np.int32)], 255)
+        masked_img = cv2.bitwise_and(self.original_cv_image, self.original_cv_image, mask=mask)
+
+        detected_text = "[Pole Niestandardowe]"
+        if self.engine == "easyocr" and self.easyocr_reader:
+            res = self.easyocr_reader.readtext(masked_img)
+            if res: detected_text = " ".join([r[1] for r in res])
+        elif self.engine != "none":
+            text = pytesseract.image_to_string(masked_img, config=r'--psm 3').strip()
+            if text: detected_text = text
+
+        rect = cv2.boundingRect(np.array(final_pts, dtype=np.int32))
+        h_est = max(10, int(rect[3] * 0.8) if angle == 0 else int(rect[2] * 0.8))
+
+        new_box = {
+            "id": str(uuid.uuid4()),
+            "points": final_pts,
             "angle": angle,
             "original_text": detected_text,
             "translated_text": None,
@@ -249,16 +306,41 @@ class ImageProcessor:
         return tokens
 
     def apply_all_edits(self):
+        if not getattr(self, 'show_replacement_text', True):
+            self.current_cv_image = self.original_cv_image.copy()
+            self._cached_rgb = np.array(Image.fromarray(cv2.cvtColor(self.current_cv_image, cv2.COLOR_BGR2RGB)))
+            self.image_changed = False
+            return
+
         img = self.original_cv_image.copy()
+
+        for box in self.boxes:
+            if box["ignored"] or box["new_text"] is None or not str(box["new_text"]).strip():
+                continue
+
+            is_selected = (box["id"] == self.selected_box_id)
+            alpha = self.selected_alpha if is_selected else 1.0
+
+            pts_array = np.array(box["points"], dtype=np.int32)
+
+            if alpha >= 1.0:
+                cv2.fillPoly(img, [pts_array], (255, 255, 255))
+            elif alpha > 0.0:
+                overlay = img.copy()
+                cv2.fillPoly(overlay, [pts_array], (255, 255, 255))
+                cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+
         img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
         for box in self.boxes:
             if box["ignored"] or box["new_text"] is None or not str(box["new_text"]).strip():
                 continue
 
-            pts_array = np.array(box["points"], dtype=np.int32)
-            cv2.fillPoly(img, [pts_array], (255, 255, 255))
-            img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+            is_selected = (box["id"] == self.selected_box_id)
+            alpha = self.selected_alpha if is_selected else 1.0
+
+            if alpha == 0.0:
+                continue
 
             try:
                 font_normal = ImageFont.truetype(box["font_family"], int(box["font_size"]))
@@ -289,24 +371,24 @@ class ImageProcessor:
             text_height = sum(line_heights) + (len(lines) - 1) * spacing if line_heights else 10
 
             pts = box["points"]
-            # Matematyczne długości boków tła dla idealnej nowej warstwy
-            box_w = math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1])
-            box_h = math.hypot(pts[3][0] - pts[0][0], pts[3][1] - pts[0][1])
+            if len(pts) == 4:
+                box_w = math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1])
+                box_h = math.hypot(pts[3][0] - pts[0][0], pts[3][1] - pts[0][1])
+            else:
+                rect = cv2.boundingRect(np.array(pts, dtype=np.int32))
+                box_w, box_h = rect[2], rect[3]
 
             pad = 2
-            # Kanwa ma rozmiar dopasowany do większego elementu (Tekst vs Ramka tła)
             canvas_w = max(text_width, box_w) + pad*2
             canvas_h = max(text_height, box_h) + pad*2
 
             txt_img = Image.new('RGBA', (int(canvas_w), int(canvas_h)), (255, 255, 255, 0))
             draw = ImageDraw.Draw(txt_img)
 
-            # Podstawa justowania poziomego
             if box["alignment"] == "Lewo": base_tx = pad
             elif box["alignment"] == "Prawo": base_tx = canvas_w - text_width - pad
             else: base_tx = (canvas_w - text_width) / 2.0
 
-            # Podstawa justowania pionowego
             if box.get("valign", "Środek") == "Góra": base_ty = pad
             elif box.get("valign", "Środek") == "Dół": base_ty = canvas_h - text_height - pad
             else: base_ty = (canvas_h - text_height) / 2.0
@@ -314,7 +396,6 @@ class ImageProcessor:
             current_y = base_ty
             for i, p_line in enumerate(parsed_lines):
                 lw = line_widths[i]
-                # Pociągnięcie wyjustowania dla pojedynczych linijek w bloku tekstu
                 if box["alignment"] == "Lewo": tx = base_tx
                 elif box["alignment"] == "Prawo": tx = base_tx + (text_width - lw)
                 else: tx = base_tx + (text_width - lw) / 2.0
@@ -331,17 +412,20 @@ class ImageProcessor:
             angle = box.get("angle", 0.0)
             rotated_txt_img = txt_img.rotate(-angle, expand=True, resample=Image.BICUBIC)
 
-            # Srodek geometryczny tła jest też zawsze idealnym środkiem wirtualnej kanwy
-            cx = sum(p[0] for p in pts) / 4.0 + box.get("shift_x", 0)
-            cy = sum(p[1] for p in pts) / 4.0 + box.get("shift_y", 0)
+            if alpha < 1.0:
+                r, g, b, a = rotated_txt_img.split()
+                a = a.point(lambda p: int(p * alpha))
+                rotated_txt_img = Image.merge('RGBA', (r, g, b, a))
+
+            cx = sum(p[0] for p in pts) / float(len(pts)) + box.get("shift_x", 0)
+            cy = sum(p[1] for p in pts) / float(len(pts)) + box.get("shift_y", 0)
 
             paste_x = int(cx - rotated_txt_img.width / 2.0)
             paste_y = int(cy - rotated_txt_img.height / 2.0)
 
             img_pil.paste(rotated_txt_img, (paste_x, paste_y), rotated_txt_img)
-            img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
-        self.current_cv_image = img
+        self.current_cv_image = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
         self._cached_rgb = np.array(img_pil)
         self.image_changed = False
 
@@ -351,9 +435,14 @@ class ImageProcessor:
         return self._cached_rgb
 
     def save(self, output_path):
+        old_id = self.selected_box_id
+        self.selected_box_id = None
         self.apply_all_edits()
+
         ext = os.path.splitext(output_path)[1]
         is_success, im_buf_arr = cv2.imencode(ext, self.current_cv_image)
         if is_success:
             with open(output_path, "wb") as f:
                 im_buf_arr.tofile(f)
+
+        self.selected_box_id = old_id
