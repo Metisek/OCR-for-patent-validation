@@ -53,7 +53,6 @@ class AppLauncher:
 
         engine = self.engine_var.get()
         auto_translate = self.translate_var.get()
-        self.root.geometry("1300x800")
         EditorWindow(self.main_frame, path, engine, auto_translate, self.build_launcher_ui)
 
 if __name__ == "__main__":

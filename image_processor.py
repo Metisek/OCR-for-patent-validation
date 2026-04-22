@@ -1,5 +1,4 @@
 import os
-# Flagi dla Paddle muszą być ZANIM zaimportujemy cokolwiek innego
 os.environ["FLAGS_enable_pir_api"] = "0"
 os.environ["FLAGS_use_mkldnn"] = "0"
 
@@ -9,44 +8,61 @@ import numpy as np
 import uuid
 import warnings
 import re
+import math
 from PIL import Image, ImageDraw, ImageFont
 from deep_translator import GoogleTranslator
 
 _GLOBAL_PADDLE_READER = None
-
-# Ustaw swoją ścieżkę do Tesseract
 pytesseract.pytesseract.tesseract_cmd = r'C:\Users\mbojarski\AppData\Local\Programs\Tesseract-OCR\tesseract.exe'
 warnings.filterwarnings("ignore", category=FutureWarning)
+
+TRANSLATION_FIXES = {
+    r"(?i)\bfiga?\.?\s*(\d+)\b": r"Fig. \1",
+    r"(?i)\bf[l|i]g\b\.?\s*(\d+)": r"Fig. \1"
+}
 
 class ImageProcessor:
     def __init__(self, image_path, engine="tesseract", auto_translate=False):
         self.image_path = image_path
         self.engine = engine
         self.auto_translate = auto_translate
-
-        # Wymuszenie jednostronnego tłumaczenia z angielskiego na polski
         self.translator = GoogleTranslator(source='en', target='pl') if auto_translate else None
 
-        self.original_cv_image = cv2.imread(image_path)
+        # ROZWIĄZANIE PROBLEMU Z POLSKIMI ZNAKAMI W ŚCIEŻKACH:
+        with open(image_path, "rb") as f:
+            chunk = f.read()
+        chunk_arr = np.frombuffer(chunk, dtype=np.uint8)
+        self.original_cv_image = cv2.imdecode(chunk_arr, cv2.IMREAD_COLOR)
+
+        if self.original_cv_image is None:
+            raise ValueError(f"Nie udało się odczytać obrazu (uszkodzony plik?): {image_path}")
+
         self.current_cv_image = self.original_cv_image.copy()
         self.boxes = []
-
-        # Puste instancje dla silników
         self.easyocr_reader = None
 
     def _strip_punctuation(self, text):
-        """Usuwa spacje i znaki interpunkcyjne do porównania (np. 'RS' == ',,RS')"""
         return ''.join(c for c in text if c.isalnum()).lower()
+
+    def _calculate_snapped_angle(self, pts):
+        pt1, pt2 = pts[0], pts[1]
+        dx = pt2[0] - pt1[0]
+        dy = pt2[1] - pt1[1]
+        raw_angle = math.degrees(math.atan2(dy, dx))
+
+        snapped = round(raw_angle / 45.0) * 45.0
+
+        if snapped <= -180: snapped += 360
+        elif snapped > 180: snapped -= 360
+        return snapped
 
     def detect_text(self):
         self.boxes = []
         gray = cv2.cvtColor(self.original_cv_image, cv2.COLOR_BGR2GRAY)
-
-        global _GLOBAL_PADDLE_READER # Używamy modelu globalnego
+        global _GLOBAL_PADDLE_READER
 
         if self.engine == "paddleocr":
             if _GLOBAL_PADDLE_READER is None:
-                print("Ładowanie modelu PaddleOCR do pamięci RAM (to nastąpi tylko raz!)...")
                 from paddleocr import PaddleOCR
                 _GLOBAL_PADDLE_READER = PaddleOCR(use_angle_cls=True, lang='en')
 
@@ -60,40 +76,26 @@ class ImageProcessor:
 
                     if text and not all(c in '|/\\-_()[]{}.~`I=:' for c in text):
                         pts = [(int(pt[0]), int(pt[1])) for pt in bbox]
-                        x, y, w, h = cv2.boundingRect(np.array(pts))
-                        pad = 2
-                        x, y, w, h = max(0, x-pad), max(0, y-pad), w+2*pad, h+2*pad
-                        straight_pts = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
-                        self._append_box(straight_pts, x, y, w, h, text)
+                        angle = self._calculate_snapped_angle(pts)
+                        self._append_box(pts, text, angle)
 
         elif self.engine == "easyocr":
             if self.easyocr_reader is None:
                 import easyocr
                 self.easyocr_reader = easyocr.Reader(['en'], gpu=False, verbose=False)
 
-            # --- POPRAWKA SKUTECZNOŚCI EASYOCR ---
-            # mag_ratio=1.5 sztucznie powiększa obraz, pomagając z małymi indeksami
-            # text_threshold i low_text obniżają rygorystyczność wykrywania
             results = self.easyocr_reader.readtext(
-                gray,
-                text_threshold=0.15,
-                low_text=0.15,
-                mag_ratio=1.5,
-                width_ths=0.5,
-                link_threshold=0.4,
-                paragraph=False
+                gray, text_threshold=0.15, low_text=0.15, mag_ratio=1.5, width_ths=0.5, link_threshold=0.4, paragraph=False
             )
 
             for (bbox, text, prob) in results:
                 if text and not all(c in '|/\\-_()[]{}.~`I=:' for c in text):
                     pts = [(int(pt[0]), int(pt[1])) for pt in bbox]
-                    x, y, w, h = cv2.boundingRect(np.array(pts))
-                    straight_pts = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
-                    self._append_box(straight_pts, x, y, w, h, text)
+                    angle = self._calculate_snapped_angle(pts)
+                    self._append_box(pts, text, angle)
 
-        else: # Tesseract (Domyślny / Fallback)
+        else: # Tesseract
             _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY)
-            # Używamy standardowego PSM 11 dla tekstu porozrzucanego
             d = pytesseract.image_to_data(thresh, config='--oem 3 --psm 11', output_type=pytesseract.Output.DICT)
             for i in range(len(d['text'])):
                 if int(d['conf'][i]) > 10:
@@ -103,14 +105,13 @@ class ImageProcessor:
                         pad = 2
                         x, y, w, h = max(0, x-pad), max(0, y-pad), w+2*pad, h+2*pad
                         pts = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
-                        self._append_box(pts, x, y, w, h, text)
+                        self._append_box(pts, text, 0.0)
 
         return self.boxes
 
-    def _append_box(self, pts, x, y, w, h, text):
+    def _append_box(self, pts, text, angle):
         text = text.strip()
-
-        est_size = max(10, int(h * 0.8))
+        h_est = max(10, int(np.linalg.norm(np.array(pts[1]) - np.array(pts[2])) * 0.8))
 
         translated_text = None
         new_text_val = None
@@ -119,7 +120,9 @@ class ImageProcessor:
             try:
                 translated = self.translator.translate(text)
                 if translated:
-                    # Zmiana: Ignoruj zmiany polegające TYLKO na interpunkcji
+                    for pattern, replacement in TRANSLATION_FIXES.items():
+                        translated = re.sub(pattern, replacement, translated)
+
                     orig_clean = self._strip_punctuation(text)
                     trans_clean = self._strip_punctuation(translated)
 
@@ -132,13 +135,13 @@ class ImageProcessor:
         self.boxes.append({
             "id": str(uuid.uuid4()),
             "points": pts,
-            "x": x, "y": y, "w": w, "h": h,
+            "angle": angle,
             "original_text": text,
             "translated_text": translated_text,
             "new_text": new_text_val,
             "ignored": False,
             "font_family": "arial.ttf",
-            "font_size": est_size,
+            "font_size": h_est,
             "alignment": "Środek",
             "line_spacing": 2,
             "shift_x": 0, "shift_y": 0
@@ -146,7 +149,7 @@ class ImageProcessor:
 
     def add_manual_polygon(self, pts):
         pts_array = np.array(pts, dtype=np.int32)
-        x, y, w, h = cv2.boundingRect(pts_array)
+        angle = self._calculate_snapped_angle(pts)
 
         mask = np.zeros(self.original_cv_image.shape[:2], dtype=np.uint8)
         cv2.fillPoly(mask, [pts_array], 255)
@@ -157,20 +160,20 @@ class ImageProcessor:
             res = self.easyocr_reader.readtext(masked_img)
             if res: detected_text = " ".join([r[1] for r in res])
         else:
-            text = pytesseract.image_to_string(masked_img, config=r'--psm 6').strip()
+            text = pytesseract.image_to_string(masked_img, config=r'--psm 3').strip()
             if text: detected_text = text
 
-        est_size = max(10, int(h * 0.8))
+        h_est = max(10, int(np.linalg.norm(np.array(pts[1]) - np.array(pts[2])) * 0.8))
         new_box = {
             "id": str(uuid.uuid4()),
             "points": pts,
-            "x": x, "y": y, "w": w, "h": h,
+            "angle": angle,
             "original_text": detected_text,
             "translated_text": None,
             "new_text": None,
             "ignored": False,
             "font_family": "arial.ttf",
-            "font_size": est_size,
+            "font_size": h_est,
             "alignment": "Środek",
             "line_spacing": 2,
             "shift_x": 0, "shift_y": 0
@@ -199,6 +202,7 @@ class ImageProcessor:
 
     def apply_all_edits(self):
         img = self.original_cv_image.copy()
+        img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
         for box in self.boxes:
             if box["ignored"] or box["new_text"] is None or not str(box["new_text"]).strip():
@@ -206,10 +210,7 @@ class ImageProcessor:
 
             pts_array = np.array(box["points"], dtype=np.int32)
             cv2.fillPoly(img, [pts_array], (255, 255, 255))
-
-            new_text = str(box["new_text"])
             img_pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-            draw = ImageDraw.Draw(img_pil)
 
             try:
                 font_normal = ImageFont.truetype(box["font_family"], int(box["font_size"]))
@@ -217,48 +218,57 @@ class ImageProcessor:
             except IOError:
                 font_normal = font_small = ImageFont.load_default()
 
-            x, y, w, h = box["x"], box["y"], box["w"], box["h"]
             spacing = box.get("line_spacing", 2)
-
-            lines = new_text.split('\n')
+            lines = str(box["new_text"]).split('\n')
             parsed_lines = [self._parse_rich_text(l) for l in lines]
+
+            temp_img = Image.new('RGBA', (1, 1))
+            draw_temp = ImageDraw.Draw(temp_img)
 
             line_widths = []
             line_heights = []
-
             for p_line in parsed_lines:
                 lw = 0
                 lh = box["font_size"]
                 for type_, txt in p_line:
                     f = font_small if type_ in ['sup', 'sub'] else font_normal
-                    try: lw += draw.textlength(txt, font=f)
-                    except AttributeError: lw += draw.textsize(txt, font=f)[0]
+                    try: lw += draw_temp.textlength(txt, font=f)
+                    except AttributeError: lw += draw_temp.textsize(txt, font=f)[0]
                 line_widths.append(lw)
                 line_heights.append(lh)
 
-            total_h = sum(line_heights) + (len(lines) - 1) * spacing
-            current_y = y + (h - total_h) / 2 + box.get("shift_y", 0)
+            text_width = max(line_widths) if line_widths else 10
+            text_height = sum(line_heights) + (len(lines) - 1) * spacing if line_heights else 10
 
+            pad = 4
+            txt_img = Image.new('RGBA', (int(text_width) + pad*2, int(text_height) + pad*2), (255, 255, 255, 0))
+            draw = ImageDraw.Draw(txt_img)
+
+            current_y = pad
             for i, p_line in enumerate(parsed_lines):
                 lw = line_widths[i]
-                if box["alignment"] == "Lewo": tx = x
-                elif box["alignment"] == "Prawo": tx = x + w - lw
-                else: tx = x + (w - lw) / 2
+                if box["alignment"] == "Lewo": tx = pad
+                elif box["alignment"] == "Prawo": tx = pad + text_width - lw
+                else: tx = pad + (text_width - lw) / 2
 
-                current_x = tx + box.get("shift_x", 0)
-
+                current_x = tx
                 for type_, txt in p_line:
                     f = font_small if type_ in ['sup', 'sub'] else font_normal
-                    y_offset = 0
-                    if type_ == 'sup': y_offset = -box["font_size"] * 0.35
-                    elif type_ == 'sub': y_offset = box["font_size"] * 0.35
-
-                    draw.text((current_x, current_y + y_offset), txt, font=f, fill=(0, 0, 0))
+                    y_offset = -box["font_size"] * 0.35 if type_ == 'sup' else (box["font_size"] * 0.35 if type_ == 'sub' else 0)
+                    draw.text((current_x, current_y + y_offset), txt, font=f, fill=(0, 0, 0, 255))
                     try: current_x += draw.textlength(txt, font=f)
                     except AttributeError: current_x += draw.textsize(txt, font=f)[0]
-
                 current_y += line_heights[i] + spacing
 
+            angle = box.get("angle", 0.0)
+            rotated_txt_img = txt_img.rotate(-angle, expand=True, resample=Image.BICUBIC)
+
+            cx = sum(p[0] for p in box["points"]) / 4.0 + box.get("shift_x", 0)
+            cy = sum(p[1] for p in box["points"]) / 4.0 + box.get("shift_y", 0)
+            paste_x = int(cx - rotated_txt_img.width / 2)
+            paste_y = int(cy - rotated_txt_img.height / 2)
+
+            img_pil.paste(rotated_txt_img, (paste_x, paste_y), rotated_txt_img)
             img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
         self.current_cv_image = img
@@ -269,4 +279,11 @@ class ImageProcessor:
 
     def save(self, output_path):
         self.apply_all_edits()
-        cv2.imwrite(output_path, self.current_cv_image)
+        # ROZWIĄZANIE ZAPISU PLIKU PRZY POLSKICH ZNAKACH W ŚCIEŻCE
+        ext = os.path.splitext(output_path)[1]
+        is_success, im_buf_arr = cv2.imencode(ext, self.current_cv_image)
+        if is_success:
+            with open(output_path, "wb") as f:
+                im_buf_arr.tofile(f)
+        else:
+            print(f"Nie udało się zapisać pliku: {output_path}")
