@@ -28,7 +28,6 @@ class ImageProcessor:
         self.auto_translate = auto_translate
         self.translator = GoogleTranslator(source='en', target='pl') if auto_translate else None
 
-        # ROZWIĄZANIE PROBLEMU Z POLSKIMI ZNAKAMI W ŚCIEŻKACH:
         with open(image_path, "rb") as f:
             chunk = f.read()
         chunk_arr = np.frombuffer(chunk, dtype=np.uint8)
@@ -41,20 +40,62 @@ class ImageProcessor:
         self.boxes = []
         self.easyocr_reader = None
 
+        self.image_changed = True
+        self._cached_rgb = None
+
     def _strip_punctuation(self, text):
         return ''.join(c for c in text if c.isalnum()).lower()
 
-    def _calculate_snapped_angle(self, pts):
-        pt1, pt2 = pts[0], pts[1]
-        dx = pt2[0] - pt1[0]
-        dy = pt2[1] - pt1[1]
-        raw_angle = math.degrees(math.atan2(dy, dx))
+    def _regularize_box(self, pts):
+        pt0, pt1, pt2, pt3 = pts
+        dx1, dy1 = pt1[0] - pt0[0], pt1[1] - pt0[1]
+        dx2, dy2 = pt2[0] - pt1[0], pt2[1] - pt1[1]
+        len1, len2 = math.hypot(dx1, dy1), math.hypot(dx2, dy2)
 
-        snapped = round(raw_angle / 45.0) * 45.0
+        if len1 == 0: len1 = 1
+        if len2 == 0: len2 = 1
 
-        if snapped <= -180: snapped += 360
-        elif snapped > 180: snapped -= 360
-        return snapped
+        if len2 / len1 >= 2.25:
+            snapped_angle = -90.0
+        elif len1 / len2 >= 2.25:
+            snapped_angle = 0.0
+        else:
+            if len1 >= len2:
+                raw_angle = math.degrees(math.atan2(dy1, dx1))
+            else:
+                raw_angle = math.degrees(math.atan2(dy2, dx2)) - 90
+            snapped_angle = round(raw_angle / 45.0) * 45.0
+
+        if snapped_angle <= -180: snapped_angle += 360
+        elif snapped_angle > 180: snapped_angle -= 360
+
+        cx = sum(p[0] for p in pts) / 4.0
+        cy = sum(p[1] for p in pts) / 4.0
+
+        rad = math.radians(-snapped_angle)
+        cos_a, sin_a = math.cos(rad), math.sin(rad)
+
+        unrotated = []
+        for p in pts:
+            rx = cx + (p[0] - cx) * cos_a - (p[1] - cy) * sin_a
+            ry = cy + (p[0] - cx) * sin_a + (p[1] - cy) * cos_a
+            unrotated.append((rx, ry))
+
+        min_x, max_x = min(p[0] for p in unrotated), max(p[0] for p in unrotated)
+        min_y, max_y = min(p[1] for p in unrotated), max(p[1] for p in unrotated)
+
+        ideal_unrotated = [(min_x, min_y), (max_x, min_y), (max_x, max_y), (min_x, max_y)]
+
+        rad_back = math.radians(snapped_angle)
+        cos_b, sin_b = math.cos(rad_back), math.sin(rad_back)
+
+        final_pts = []
+        for p in ideal_unrotated:
+            rx = cx + (p[0] - cx) * cos_b - (p[1] - cy) * sin_b
+            ry = cy + (p[0] - cx) * sin_b + (p[1] - cy) * cos_b
+            final_pts.append((rx, ry))
+
+        return final_pts, snapped_angle
 
     def detect_text(self):
         self.boxes = []
@@ -76,7 +117,7 @@ class ImageProcessor:
 
                     if text and not all(c in '|/\\-_()[]{}.~`I=:' for c in text):
                         pts = [(int(pt[0]), int(pt[1])) for pt in bbox]
-                        angle = self._calculate_snapped_angle(pts)
+                        pts, angle = self._regularize_box(pts)
                         self._append_box(pts, text, angle)
 
         elif self.engine == "easyocr":
@@ -91,7 +132,7 @@ class ImageProcessor:
             for (bbox, text, prob) in results:
                 if text and not all(c in '|/\\-_()[]{}.~`I=:' for c in text):
                     pts = [(int(pt[0]), int(pt[1])) for pt in bbox]
-                    angle = self._calculate_snapped_angle(pts)
+                    pts, angle = self._regularize_box(pts)
                     self._append_box(pts, text, angle)
 
         else: # Tesseract
@@ -107,6 +148,7 @@ class ImageProcessor:
                         pts = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
                         self._append_box(pts, text, 0.0)
 
+        self.image_changed = True
         return self.boxes
 
     def _append_box(self, pts, text, angle):
@@ -143,16 +185,19 @@ class ImageProcessor:
             "font_family": "arial.ttf",
             "font_size": h_est,
             "alignment": "Środek",
+            "valign": "Środek",
             "line_spacing": 2,
             "shift_x": 0, "shift_y": 0
         })
 
     def add_manual_polygon(self, pts):
         pts_array = np.array(pts, dtype=np.int32)
-        angle = self._calculate_snapped_angle(pts)
+        x, y, w, h = cv2.boundingRect(pts_array)
+        rect_pts = [(x, y), (x+w, y), (x+w, y+h), (x, y+h)]
+        angle = 0.0
 
         mask = np.zeros(self.original_cv_image.shape[:2], dtype=np.uint8)
-        cv2.fillPoly(mask, [pts_array], 255)
+        cv2.fillPoly(mask, [np.array(rect_pts)], 255)
         masked_img = cv2.bitwise_and(self.original_cv_image, self.original_cv_image, mask=mask)
 
         detected_text = "[Pole Niestandardowe]"
@@ -163,10 +208,10 @@ class ImageProcessor:
             text = pytesseract.image_to_string(masked_img, config=r'--psm 3').strip()
             if text: detected_text = text
 
-        h_est = max(10, int(np.linalg.norm(np.array(pts[1]) - np.array(pts[2])) * 0.8))
+        h_est = max(10, int(h * 0.8))
         new_box = {
             "id": str(uuid.uuid4()),
-            "points": pts,
+            "points": rect_pts,
             "angle": angle,
             "original_text": detected_text,
             "translated_text": None,
@@ -175,14 +220,17 @@ class ImageProcessor:
             "font_family": "arial.ttf",
             "font_size": h_est,
             "alignment": "Środek",
+            "valign": "Środek",
             "line_spacing": 2,
             "shift_x": 0, "shift_y": 0
         }
         self.boxes.append(new_box)
+        self.image_changed = True
         return new_box
 
     def delete_box(self, box_id):
         self.boxes = [b for b in self.boxes if b["id"] != box_id]
+        self.image_changed = True
 
     def _parse_rich_text(self, line):
         tokens = []
@@ -241,7 +289,10 @@ class ImageProcessor:
             text_height = sum(line_heights) + (len(lines) - 1) * spacing if line_heights else 10
 
             pad = 4
-            txt_img = Image.new('RGBA', (int(text_width) + pad*2, int(text_height) + pad*2), (255, 255, 255, 0))
+            txt_w = int(text_width) + pad*2
+            txt_h = int(text_height) + pad*2
+
+            txt_img = Image.new('RGBA', (txt_w, txt_h), (255, 255, 255, 0))
             draw = ImageDraw.Draw(txt_img)
 
             current_y = pad
@@ -263,27 +314,57 @@ class ImageProcessor:
             angle = box.get("angle", 0.0)
             rotated_txt_img = txt_img.rotate(-angle, expand=True, resample=Image.BICUBIC)
 
-            cx = sum(p[0] for p in box["points"]) / 4.0 + box.get("shift_x", 0)
-            cy = sum(p[1] for p in box["points"]) / 4.0 + box.get("shift_y", 0)
-            paste_x = int(cx - rotated_txt_img.width / 2)
-            paste_y = int(cy - rotated_txt_img.height / 2)
+            pts = box["points"]
+            box_w = math.hypot(pts[1][0] - pts[0][0], pts[1][1] - pts[0][1])
+            box_h = math.hypot(pts[3][0] - pts[0][0], pts[3][1] - pts[0][1])
+
+            # Matematyka justowania poziomego wzdłuż ramki
+            shift_align = 0
+            if box["alignment"] == "Lewo":
+                shift_align = - (box_w - txt_w) / 2.0
+            elif box["alignment"] == "Prawo":
+                shift_align = (box_w - txt_w) / 2.0
+
+            # Matematyka justowania pionowego (względem wysokości ramki tła)
+            shift_align_v = 0
+            if box.get("valign", "Środek") == "Góra":
+                shift_align_v = - (box_h - txt_h) / 2.0
+            elif box.get("valign", "Środek") == "Dół":
+                shift_align_v = (box_h - txt_h) / 2.0
+
+            rad = math.radians(angle)
+            dir_x = math.cos(rad)
+            dir_y = math.sin(rad)
+
+            # Wektor prostopadły (dla osi pionowej)
+            perp_x = -math.sin(rad)
+            perp_y = math.cos(rad)
+
+            cx = sum(p[0] for p in pts) / 4.0
+            cy = sum(p[1] for p in pts) / 4.0
+
+            final_cx = cx + (shift_align * dir_x) + (shift_align_v * perp_x) + box.get("shift_x", 0)
+            final_cy = cy + (shift_align * dir_y) + (shift_align_v * perp_y) + box.get("shift_y", 0)
+
+            paste_x = int(final_cx - rotated_txt_img.width / 2.0)
+            paste_y = int(final_cy - rotated_txt_img.height / 2.0)
 
             img_pil.paste(rotated_txt_img, (paste_x, paste_y), rotated_txt_img)
             img = cv2.cvtColor(np.array(img_pil), cv2.COLOR_RGB2BGR)
 
         self.current_cv_image = img
+        self._cached_rgb = np.array(img_pil)
+        self.image_changed = False
 
     def get_rgb_image(self):
-        self.apply_all_edits()
-        return cv2.cvtColor(self.current_cv_image, cv2.COLOR_BGR2RGB)
+        if self.image_changed or self._cached_rgb is None:
+            self.apply_all_edits()
+        return self._cached_rgb
 
     def save(self, output_path):
         self.apply_all_edits()
-        # ROZWIĄZANIE ZAPISU PLIKU PRZY POLSKICH ZNAKACH W ŚCIEŻCE
         ext = os.path.splitext(output_path)[1]
         is_success, im_buf_arr = cv2.imencode(ext, self.current_cv_image)
         if is_success:
             with open(output_path, "wb") as f:
                 im_buf_arr.tofile(f)
-        else:
-            print(f"Nie udało się zapisać pliku: {output_path}")

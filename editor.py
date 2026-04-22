@@ -83,12 +83,20 @@ class EditorWindow:
         self.dragged_vertex_idx = None
 
         self.scale = 1.0
+        self.base_scale = 1.0
         self.offset_x = 0; self.offset_y = 0
+
+        self.is_panning = False
+        self.pan_last_x = 0
+        self.pan_last_y = 0
+        self.pan_offset_x = 0
+        self.pan_offset_y = 0
+
         self.drawing_poly_mode = False
         self.current_poly_points = []
-        self.temp_lines = []
-
         self._is_updating_sidebar = False
+
+        self.fast_delete_var = tk.BooleanVar(value=False)
 
         self.process_all_images()
 
@@ -136,7 +144,6 @@ class EditorWindow:
                 self.source_thumbnails.append(pil_img)
             except Exception as e:
                 print(f"Pominięto plik {filename} z powodu błędu: {e}")
-                # Na wypadek, gdyby plik mimo wczytania z numpy był np. zepsutym TIF-em
                 self.image_files.remove(filename)
 
         self.progress_frame.destroy()
@@ -145,6 +152,7 @@ class EditorWindow:
         if self.image_files:
             self.setup_ui()
             self.select_image(0, auto_scroll=True)
+            root_win.bind("<Delete>", self.handle_delete_key)
         else:
             self.on_close()
 
@@ -153,6 +161,15 @@ class EditorWindow:
 
         self.canvas = tk.Canvas(self.frame, cursor="cross", bg="#333333")
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.canvas_zoom_frame = tk.Frame(self.frame, bg="#e0e0e0", bd=1, relief=tk.RAISED)
+        self.canvas_zoom_frame.place(relx=0.0, rely=1.0, anchor='sw', x=10, y=-10)
+
+        tk.Label(self.canvas_zoom_frame, text="Powiększenie obrazu:", bg="#e0e0e0", font=("Arial", 8)).pack(side=tk.LEFT, padx=5)
+        self.canvas_zoom_var = tk.DoubleVar(value=100.0)
+        self.canvas_zoom_slider = ttk.Scale(self.canvas_zoom_frame, from_=20, to=500, orient=tk.HORIZONTAL, variable=self.canvas_zoom_var, command=lambda e: self.redraw_canvas())
+        self.canvas_zoom_slider.pack(side=tk.LEFT, padx=5, pady=2)
+        tk.Button(self.canvas_zoom_frame, text="Reset", font=("Arial", 7), command=self.reset_zoom).pack(side=tk.LEFT, padx=2)
 
         self.sidebar_container = tk.Frame(self.frame, width=320, bg="#f0f0f0")
         self.sidebar_container.pack(side=tk.RIGHT, fill=tk.Y)
@@ -177,7 +194,7 @@ class EditorWindow:
         self.paned_window.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
 
         self.top_pane = tk.Frame(self.paned_window, bg="#f0f0f0")
-        self.paned_window.add(self.top_pane, minsize=250, stretch="always")
+        self.paned_window.add(self.top_pane, minsize=350, stretch="always")
 
         self.tools_canvas = tk.Canvas(self.top_pane, bg="#f0f0f0", highlightthickness=0)
         self.tools_scrollbar = ttk.Scrollbar(self.top_pane, orient="vertical", command=self.tools_canvas.yview)
@@ -187,10 +204,9 @@ class EditorWindow:
 
         def on_tools_canvas_configure(event):
             self.tools_canvas.itemconfig(self.tools_window, width=event.width)
-            if self.tools_inner.winfo_reqheight() < event.height:
-                self.tools_canvas.itemconfig(self.tools_window, height=event.height)
-            else:
-                self.tools_canvas.itemconfig(self.tools_window, height="")
+            req_h = self.tools_inner.winfo_reqheight()
+            new_h = max(req_h, event.height)
+            self.tools_canvas.itemconfig(self.tools_window, height=new_h)
             self.tools_canvas.configure(scrollregion=self.tools_canvas.bbox("all"))
 
         self.tools_canvas.bind("<Configure>", on_tools_canvas_configure)
@@ -202,8 +218,13 @@ class EditorWindow:
         self.tools_canvas.bind_all("<MouseWheel>", self._on_mousewheel_tools)
 
         tk.Button(self.tools_inner, text="[+] Narysuj Wielokąt (LPM: punkt, PPM: zamknij)", command=self.toggle_draw_mode, bg="#FFC107").pack(fill=tk.X, pady=(0, 5))
-        self.btn_delete = tk.Button(self.tools_inner, text="KOSZ: Usuń zaznaczone pole", command=self.delete_current_box, bg="#FF5252", fg="white")
-        self.btn_delete.pack(fill=tk.X, pady=(0, 5))
+
+        del_frame = tk.Frame(self.tools_inner, bg="#f0f0f0")
+        del_frame.pack(fill=tk.X, pady=(0, 5))
+        self.btn_delete = tk.Button(del_frame, text="Usuń zazn. pole", command=self.delete_current_box, bg="#FF5252", fg="white")
+        self.btn_delete.pack(side=tk.LEFT)
+        self.chk_fast_del = tk.Checkbutton(del_frame, text="Włącz szybkie usuwanie (DEL)", variable=self.fast_delete_var, bg="#f0f0f0", font=("Arial", 8))
+        self.chk_fast_del.pack(side=tk.LEFT, padx=5)
 
         tk.Label(self.tools_inner, text="Oryginał:", bg="#f0f0f0", fg="#555", font=("Arial", 8)).pack(anchor=tk.W)
         self.txt_original = tk.Text(self.tools_inner, height=2, font=("Arial", 10, "bold"), bg="#f0f0f0", relief=tk.FLAT)
@@ -216,8 +237,8 @@ class EditorWindow:
         tk.Button(t_frame, text="X₂", command=self.insert_sub, font=("Arial", 8), pady=0).pack(side=tk.RIGHT, padx=2)
         tk.Button(t_frame, text="X²", command=self.insert_sup, font=("Arial", 8), pady=0).pack(side=tk.RIGHT)
 
-        self.text_new = tk.Text(self.tools_inner, font=("Arial", 11))
-        self.text_new.pack(fill=tk.BOTH, expand=True, pady=(0, 5))
+        self.text_new = tk.Text(self.tools_inner, font=("Arial", 11), height=4)
+        self.text_new.pack(fill=tk.X, pady=(0, 5))
         self.text_new.bind("<KeyRelease>", self.auto_apply)
 
         fmt_frame = tk.LabelFrame(self.tools_inner, text="Ustawienia", bg="#f0f0f0", padx=5, pady=2)
@@ -254,22 +275,27 @@ class EditorWindow:
         self.size_var.trace_add("write", lambda *args: self.auto_apply())
 
         self.align_var = tk.StringVar()
-        tk.Label(fmt_frame, text="Justowanie:", bg="#f0f0f0", font=("Arial", 8)).grid(row=1, column=2, sticky=tk.W)
-        self.combo_align = ttk.Combobox(fmt_frame, textvariable=self.align_var, values=["Lewo", "Środek", "Prawo"], state="readonly", width=8)
+        tk.Label(fmt_frame, text="Poziom:", bg="#f0f0f0", font=("Arial", 8)).grid(row=1, column=2, sticky=tk.W, padx=(5,0))
+        self.combo_align = ttk.Combobox(fmt_frame, textvariable=self.align_var, values=["Lewo", "Środek", "Prawo"], state="readonly", width=7)
         self.combo_align.grid(row=1, column=3, sticky=tk.W)
         self.align_var.trace_add("write", lambda *args: self.auto_apply())
 
         self.angle_var = tk.StringVar()
         tk.Label(fmt_frame, text="Kąt (°):", bg="#f0f0f0", font=("Arial", 8)).grid(row=2, column=0, sticky=tk.W)
-        # ZMIANA: increment=1 pozwala na wpisywanie lub strzałkowanie co 1 stopień
         self.spin_angle = ttk.Spinbox(fmt_frame, from_=-180, to=180, increment=1, width=4, textvariable=self.angle_var)
         self.spin_angle.grid(row=2, column=1, sticky=tk.W)
         self.angle_var.trace_add("write", lambda *args: self.auto_apply())
 
+        self.valign_var = tk.StringVar()
+        tk.Label(fmt_frame, text="Pion:", bg="#f0f0f0", font=("Arial", 8)).grid(row=2, column=2, sticky=tk.W, padx=(5,0))
+        self.combo_valign = ttk.Combobox(fmt_frame, textvariable=self.valign_var, values=["Góra", "Środek", "Dół"], state="readonly", width=7)
+        self.combo_valign.grid(row=2, column=3, sticky=tk.W)
+        self.valign_var.trace_add("write", lambda *args: self.auto_apply())
+
         self.spacing_var = tk.StringVar()
-        tk.Label(fmt_frame, text="Interlinia:", bg="#f0f0f0", font=("Arial", 8)).grid(row=2, column=2, sticky=tk.W)
+        tk.Label(fmt_frame, text="Interlinia:", bg="#f0f0f0", font=("Arial", 8)).grid(row=3, column=0, sticky=tk.W)
         self.spin_spacing = ttk.Spinbox(fmt_frame, from_=-20, to=50, width=4, textvariable=self.spacing_var)
-        self.spin_spacing.grid(row=2, column=3, sticky=tk.W)
+        self.spin_spacing.grid(row=3, column=1, sticky=tk.W)
         self.spacing_var.trace_add("write", lambda *args: self.auto_apply())
 
         shift_frame = tk.Frame(self.tools_inner, bg="#f0f0f0")
@@ -288,7 +314,6 @@ class EditorWindow:
         btn_frame.pack(fill=tk.X, pady=5)
         tk.Button(btn_frame, text="Ignoruj", command=self.ignore_box).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
         tk.Button(btn_frame, text="Przywróć", command=self.revert_to_original).pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(2, 0))
-
 
         self.bottom_pane = tk.Frame(self.paned_window, bg="#f0f0f0")
         self.paned_window.add(self.bottom_pane, minsize=100, stretch="always")
@@ -320,6 +345,20 @@ class EditorWindow:
         self.canvas.bind("<B1-Motion>", self.on_mouse_drag)
         self.canvas.bind("<ButtonRelease-1>", self.on_left_release)
         self.canvas.bind("<ButtonPress-3>", self.on_right_click)
+
+    def handle_delete_key(self, event):
+        focused = self.frame.focus_get()
+        if isinstance(focused, (tk.Text, tk.Entry, tk.Spinbox, ttk.Spinbox, ttk.Combobox)):
+            return
+
+        if self.fast_delete_var.get() and self.selected_box:
+            self.delete_current_box()
+
+    def reset_zoom(self):
+        self.canvas_zoom_var.set(100.0)
+        self.pan_offset_x = 0
+        self.pan_offset_y = 0
+        self.redraw_canvas()
 
     def _on_mousewheel_tools(self, event):
         if self.tools_canvas.winfo_rootx() <= event.widget.winfo_rootx() <= self.tools_canvas.winfo_rootx() + self.tools_canvas.winfo_width():
@@ -396,6 +435,7 @@ class EditorWindow:
 
     def select_image(self, index, auto_scroll=True):
         if index < 0 or index >= len(self.image_files): return
+
         self.current_index = index
         filename = self.image_files[self.current_index]
         self.frame.master.title(f"Edytor - {filename} ({self.current_index + 1}/{len(self.image_files)})")
@@ -403,6 +443,10 @@ class EditorWindow:
         self.processor = self.processors[filename]
         self.selected_box = None
         if self.drawing_poly_mode: self.toggle_draw_mode()
+
+        self.canvas_zoom_var.set(100.0)
+        self.pan_offset_x = 0
+        self.pan_offset_y = 0
 
         self.update_sidebar()
         self.update_gallery_highlight(auto_scroll)
@@ -445,9 +489,6 @@ class EditorWindow:
     def toggle_draw_mode(self):
         self.drawing_poly_mode = not self.drawing_poly_mode
         self.current_poly_points = []
-        for line in self.temp_lines: self.canvas.delete(line)
-        self.temp_lines = []
-
         if self.drawing_poly_mode:
             self.btn_draw.config(bg="#4CAF50", text="[Trwa rysowanie...]")
             self.canvas.config(cursor="crosshair")
@@ -457,41 +498,67 @@ class EditorWindow:
         else:
             self.btn_draw.config(bg="#FFC107", text="[+] Narysuj Wielokąt")
             self.canvas.config(cursor="cross")
+            self.redraw_canvas()
 
     def redraw_canvas(self, event=None):
         if not hasattr(self, 'processor'): return
         canvas_w, canvas_h = self.canvas.winfo_width(), self.canvas.winfo_height()
         if canvas_w < 10 or canvas_h < 10: return
 
+        # KLUCZOWA POPRAWKA 1: Zapamiętanie flagi ZANIM get_rgb_image() ją zresetuje
+        needs_pixel_update = self.processor.image_changed
+
         img_rgb = self.processor.get_rgb_image()
-        orig_pil = Image.fromarray(img_rgb)
-        img_w, img_h = orig_pil.size
+        img_h, img_w = img_rgb.shape[:2]
 
-        self.scale = min(canvas_w / img_w, canvas_h / img_h)
-        if self.scale > 1.5: self.scale = 1.5
+        self.base_scale = min(canvas_w / img_w, canvas_h / img_h)
+        if self.base_scale > 1.5: self.base_scale = 1.5
 
-        new_w, new_h = int(img_w * self.scale), int(img_h * self.scale)
-        self.offset_x = (canvas_w - new_w) // 2
-        self.offset_y = (canvas_h - new_h) // 2
+        zoom_multiplier = self.canvas_zoom_var.get() / 100.0
+        new_scale = self.base_scale * zoom_multiplier
 
-        resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
-        resized_img = orig_pil.resize((new_w, new_h), resample)
-        draw = ImageDraw.Draw(resized_img)
+        # Aktualizujemy płótno, jeśli zmienił się zoom, pierwszy raz rysujemy, ALBO flaga zgłosiła zmianę
+        if getattr(self, '_last_scale', None) != new_scale or needs_pixel_update or not hasattr(self, 'tk_img'):
+            self.scale = new_scale
+            new_w, new_h = int(img_w * self.scale), int(img_h * self.scale)
+            if new_w > 10000 or new_h > 10000: return
+
+            orig_pil = Image.fromarray(img_rgb)
+            resample = Image.Resampling.LANCZOS if hasattr(Image, 'Resampling') else Image.LANCZOS
+            resized_img = orig_pil.resize((new_w, new_h), resample)
+            self.tk_img = ImageTk.PhotoImage(resized_img)
+            self._last_scale = self.scale
+            self._last_w, self._last_h = new_w, new_h
+
+        base_off_x = (canvas_w - self._last_w) // 2
+        base_off_y = (canvas_h - self._last_h) // 2
+        self.offset_x = base_off_x + self.pan_offset_x
+        self.offset_y = base_off_y + self.pan_offset_y
+
+        self.canvas.delete("all")
+        self.canvas.create_image(self.offset_x, self.offset_y, anchor=tk.NW, image=self.tk_img)
 
         for box in self.processor.boxes:
             color = "#00FF00" if box == self.selected_box else ("gray" if box["ignored"] else ("#FFA500" if box["new_text"] is not None else "red"))
-            scaled_pts = [(int(p[0]*self.scale), int(p[1]*self.scale)) for p in box["points"]]
-            if len(scaled_pts) > 2: draw.polygon(scaled_pts, outline=color, width=2)
-            elif len(scaled_pts) == 2: draw.line(scaled_pts, fill=color, width=2)
+            scaled_pts = [(int(p[0]*self.scale) + self.offset_x, int(p[1]*self.scale) + self.offset_y) for p in box["points"]]
 
-        self.tk_img = ImageTk.PhotoImage(resized_img)
-        self.canvas.delete("all")
-        self.canvas.create_image(self.offset_x, self.offset_y, anchor=tk.NW, image=self.tk_img)
+            flat_pts = [coord for pt in scaled_pts for coord in pt]
+            if len(scaled_pts) > 2:
+                self.canvas.create_polygon(flat_pts, outline=color, fill="", width=2)
+            elif len(scaled_pts) == 2:
+                self.canvas.create_line(flat_pts, fill=color, width=2)
 
         if self.selected_box:
             for pt in self.selected_box["points"]:
                 px, py = int(pt[0]*self.scale) + self.offset_x, int(pt[1]*self.scale) + self.offset_y
                 self.canvas.create_rectangle(px-4, py-4, px+4, py+4, fill="#2196F3", outline="white", width=1)
+
+        if self.drawing_poly_mode and len(self.current_poly_points) > 0:
+            for i in range(len(self.current_poly_points) - 1):
+                p1, p2 = self.current_poly_points[i], self.current_poly_points[i+1]
+                x1, y1 = p1[0]*self.scale + self.offset_x, p1[1]*self.scale + self.offset_y
+                x2, y2 = p2[0]*self.scale + self.offset_x, p2[1]*self.scale + self.offset_y
+                self.canvas.create_line(x1, y1, x2, y2, fill="yellow", width=2)
 
     def get_orig_coords(self, event_x, event_y):
         return (event_x - self.offset_x) / self.scale, (event_y - self.offset_y) / self.scale
@@ -514,12 +581,7 @@ class EditorWindow:
 
         if self.drawing_poly_mode:
             self.current_poly_points.append((orig_x, orig_y))
-            if len(self.current_poly_points) > 1:
-                p1, p2 = self.current_poly_points[-2], self.current_poly_points[-1]
-                x1, y1 = p1[0]*self.scale + self.offset_x, p1[1]*self.scale + self.offset_y
-                x2, y2 = p2[0]*self.scale + self.offset_x, p2[1]*self.scale + self.offset_y
-                line = self.canvas.create_line(x1, y1, x2, y2, fill="yellow", width=2)
-                self.temp_lines.append(line)
+            self.redraw_canvas()
             return
 
         if self.selected_box:
@@ -539,6 +601,15 @@ class EditorWindow:
             self.update_sidebar()
             self.redraw_canvas()
 
+        # KLUCZOWA POPRAWKA 2: Przeniesienie focusu na canvas, by unikać auto-zaznaczania pola tekstowego
+        self.canvas.focus_set()
+
+        if not clicked_box and self.dragged_vertex_idx is None:
+            self.is_panning = True
+            self.pan_last_x = event.x
+            self.pan_last_y = event.y
+            self.canvas.config(cursor="fleur")
+
     def on_mouse_drag(self, event):
         if self.dragged_vertex_idx is not None and self.selected_box:
             orig_x, orig_y = self.get_orig_coords(event.x, event.y)
@@ -548,10 +619,24 @@ class EditorWindow:
             self.selected_box["points"][self.dragged_vertex_idx] = (int(orig_x), int(orig_y))
             self.redraw_canvas()
 
+        elif getattr(self, 'is_panning', False):
+            dx = event.x - self.pan_last_x
+            dy = event.y - self.pan_last_y
+            self.pan_offset_x += dx
+            self.pan_offset_y += dy
+            self.pan_last_x = event.x
+            self.pan_last_y = event.y
+            self.redraw_canvas()
+
     def on_left_release(self, event):
         if self.dragged_vertex_idx is not None:
             self.dragged_vertex_idx = None
+            self.processor.image_changed = True
             self.redraw_canvas()
+
+        if getattr(self, 'is_panning', False):
+            self.is_panning = False
+            self.canvas.config(cursor="cross")
 
     def on_right_click(self, event):
         if self.drawing_poly_mode and len(self.current_poly_points) > 2:
@@ -577,7 +662,7 @@ class EditorWindow:
         self.shift_x_var.set("0")
         self.shift_y_var.set("0")
 
-        widgets_to_toggle = [self.btn_font, self.spin_size, self.combo_align, self.spin_angle, self.spin_spacing, self.spin_x, self.spin_y]
+        widgets_to_toggle = [self.btn_font, self.spin_size, self.combo_align, self.combo_valign, self.spin_angle, self.spin_spacing, self.spin_x, self.spin_y]
 
         if self.selected_box:
             self.btn_delete.config(state="normal")
@@ -601,6 +686,7 @@ class EditorWindow:
             self.font_var.set(font_name)
             self.size_var.set(str(self.selected_box["font_size"]))
             self.align_var.set(self.selected_box["alignment"])
+            self.valign_var.set(self.selected_box.get("valign", "Środek"))
             self.angle_var.set(str(int(self.selected_box.get("angle", 0))))
             self.spacing_var.set(str(self.selected_box.get("line_spacing", 2)))
             self.shift_x_var.set(str(self.selected_box.get("shift_x", 0)))
@@ -610,7 +696,7 @@ class EditorWindow:
                 state_mode = "readonly" if isinstance(w, ttk.Combobox) else "normal"
                 w.config(state=state_mode)
 
-            self.text_new.focus()
+            # USUNIĘTO auto-focus na text_new, by nie psuć skrótu DEL
         else:
             self.btn_delete.config(state="disabled")
             self.txt_original.config(state=tk.NORMAL)
@@ -645,13 +731,17 @@ class EditorWindow:
             except ValueError: pass
 
             self.selected_box["alignment"] = self.align_var.get()
+            self.selected_box["valign"] = self.valign_var.get()
             self.selected_box["ignored"] = False
+
+            self.processor.image_changed = True
             self.redraw_canvas()
 
     def ignore_box(self):
         if self.selected_box:
             self.selected_box["ignored"] = True
             self.selected_box["new_text"] = None
+            self.processor.image_changed = True
             self.update_sidebar()
             self.redraw_canvas()
 
@@ -659,5 +749,6 @@ class EditorWindow:
         if self.selected_box:
             self.selected_box["ignored"] = False
             self.selected_box["new_text"] = None
+            self.processor.image_changed = True
             self.update_sidebar()
             self.redraw_canvas()
