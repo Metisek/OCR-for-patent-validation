@@ -1,7 +1,7 @@
 import os
 os.environ["FLAGS_enable_pir_api"] = "0"
 os.environ["FLAGS_use_mkldnn"] = "0"
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE" # Zabezpieczenie przed błędem libiomp5md.dll
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import cv2
 import pytesseract

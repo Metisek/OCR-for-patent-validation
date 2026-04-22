@@ -12,6 +12,21 @@ import math
 import matplotlib.font_manager as fm
 from image_processor import ImageProcessor
 
+def get_line_intersection(p1, v1, p2, v2):
+    cross = v1[0]*v2[1] - v1[1]*v2[0]
+    if abs(cross) < 1e-6: return None
+    dx = p2[0] - p1[0]
+    dy = p2[1] - p1[1]
+    t1 = (dx*v2[1] - dy*v2[0]) / cross
+    return (p1[0] + t1*v1[0], p1[1] + t1*v1[1])
+
+def is_valid_poly(pts):
+    if len(pts) < 2: return True
+    for i in range(len(pts)):
+        d = math.hypot(pts[i][0] - pts[(i+1)%len(pts)][0], pts[i][1] - pts[(i+1)%len(pts)][1])
+        if d < 3: return False
+    return True
+
 class ConflictDialog(tk.Toplevel):
     def __init__(self, parent, filename):
         super().__init__(parent)
@@ -124,9 +139,11 @@ class EditorWindow:
 
         self.selected_box = None
         self.dragged_vertex_idx = None
+        self.dragged_edge_idx = None
         self.dragged_box = False
         self.drag_start_x = 0
         self.drag_start_y = 0
+        self.drag_start_points = []
 
         self.scale = 1.0
         self.base_scale = 1.0
@@ -147,7 +164,10 @@ class EditorWindow:
         self._typing_timer = None
         self.fast_delete_var = tk.BooleanVar(value=False)
         self.clipboard_box = None
+
         self.format_source_box = None
+        self.size_source_box = None
+        self.aio_source_box = None
 
         self.last_font_size = 24
         self.last_line_spacing = 2
@@ -211,6 +231,10 @@ class EditorWindow:
             root_win.bind("<Control-v>", self.paste_box)
             root_win.bind("<v>", self.handle_v_key)
             root_win.bind("<V>", self.handle_v_key)
+            root_win.bind("<c>", self.handle_c_key)
+            root_win.bind("<C>", self.handle_c_key)
+            root_win.bind("<x>", self.handle_x_key)
+            root_win.bind("<X>", self.handle_x_key)
         else:
             self.on_close()
 
@@ -219,7 +243,6 @@ class EditorWindow:
 
         self.canvas = tk.Canvas(self.frame, cursor="cross", bg="#333333")
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        # Bindowanie scrolla dla zoomowania z poziomu Canvas
         self.canvas.bind("<MouseWheel>", self._on_mousewheel_canvas)
 
         self.canvas_zoom_frame = tk.Frame(self.frame, bg="#e0e0e0", bd=1, relief=tk.RAISED)
@@ -293,10 +316,17 @@ class EditorWindow:
         self.tools_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.tools_canvas.bind_all("<MouseWheel>", self._on_mousewheel_tools)
 
-        top_btn_frame = tk.Frame(self.tools_inner, bg="#f0f0f0")
-        top_btn_frame.pack(fill=tk.X, pady=(0, 5))
-        self.btn_format_painter = tk.Button(top_btn_frame, text="🖌️ Malarz Formatu (V)", command=self.toggle_format_painter, bg="#e0e0e0")
-        self.btn_format_painter.pack(fill=tk.X)
+        btn_frame_painters = tk.Frame(self.tools_inner, bg="#f0f0f0")
+        btn_frame_painters.pack(fill=tk.X, pady=(0, 5))
+
+        self.btn_format_painter = tk.Button(btn_frame_painters, text="🖌️ Format (V)", command=self.toggle_format_painter, bg="#e0e0e0", font=("Arial", 8))
+        self.btn_format_painter.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 1))
+
+        self.btn_size_painter = tk.Button(btn_frame_painters, text="📏 Rozmiar (C)", command=self.toggle_size_painter, bg="#e0e0e0", font=("Arial", 8))
+        self.btn_size_painter.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(1, 1))
+
+        self.btn_aio_painter = tk.Button(btn_frame_painters, text="✨ AIO (X)", command=self.toggle_aio_painter, bg="#e0e0e0", font=("Arial", 8))
+        self.btn_aio_painter.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(1, 0))
 
         draw_btn_frame = tk.Frame(self.tools_inner, bg="#f0f0f0")
         draw_btn_frame.pack(fill=tk.X, pady=(0, 5))
@@ -389,9 +419,21 @@ class EditorWindow:
         self.spin_spacing.grid(row=3, column=1, sticky=tk.W)
         self.spacing_var.trace_add("write", lambda *args: self.auto_apply())
 
+        dim_frame = tk.Frame(self.tools_inner, bg="#f0f0f0")
+        dim_frame.pack(fill=tk.X, pady=2)
+        tk.Label(dim_frame, text="Wymiary pikselowe (W, H):", bg="#f0f0f0", font=("Arial", 8)).pack(side=tk.LEFT)
+        self.height_var = tk.StringVar()
+        self.spin_h = ttk.Spinbox(dim_frame, from_=1, to=5000, width=5, textvariable=self.height_var)
+        self.spin_h.pack(side=tk.RIGHT, padx=2)
+        self.width_var = tk.StringVar()
+        self.spin_w = ttk.Spinbox(dim_frame, from_=1, to=5000, width=5, textvariable=self.width_var)
+        self.spin_w.pack(side=tk.RIGHT)
+        self.width_var.trace_add("write", lambda *args: self.auto_apply())
+        self.height_var.trace_add("write", lambda *args: self.auto_apply())
+
         shift_frame = tk.Frame(self.tools_inner, bg="#f0f0f0")
         shift_frame.pack(fill=tk.X, pady=2)
-        tk.Label(shift_frame, text="Przesunięcie (X, Y):", bg="#f0f0f0", font=("Arial", 8)).pack(side=tk.LEFT)
+        tk.Label(shift_frame, text="Przesunięcie względem tła (X, Y):", bg="#f0f0f0", font=("Arial", 8)).pack(side=tk.LEFT)
         self.shift_y_var = tk.StringVar()
         self.spin_y = ttk.Spinbox(shift_frame, from_=-100, to=100, width=4, textvariable=self.shift_y_var)
         self.spin_y.pack(side=tk.RIGHT, padx=2)
@@ -465,9 +507,18 @@ class EditorWindow:
 
     def handle_v_key(self, event):
         focused = self.frame.focus_get()
-        if isinstance(focused, (tk.Text, tk.Entry, tk.Spinbox, ttk.Spinbox, ttk.Combobox)):
-            return
+        if isinstance(focused, (tk.Text, tk.Entry, tk.Spinbox, ttk.Spinbox, ttk.Combobox)): return
         self.toggle_format_painter()
+
+    def handle_c_key(self, event):
+        focused = self.frame.focus_get()
+        if isinstance(focused, (tk.Text, tk.Entry, tk.Spinbox, ttk.Spinbox, ttk.Combobox)): return
+        self.toggle_size_painter()
+
+    def handle_x_key(self, event):
+        focused = self.frame.focus_get()
+        if isinstance(focused, (tk.Text, tk.Entry, tk.Spinbox, ttk.Spinbox, ttk.Combobox)): return
+        self.toggle_aio_painter()
 
     def apply_font_everywhere(self):
         if not self.selected_box: return
@@ -477,16 +528,65 @@ class EditorWindow:
         self.processor.image_changed = True
         self.redraw_canvas()
 
+    def clear_painters(self):
+        self.format_source_box = None
+        self.size_source_box = None
+        self.aio_source_box = None
+        self.btn_format_painter.config(bg="#e0e0e0")
+        self.btn_size_painter.config(bg="#e0e0e0")
+        self.btn_aio_painter.config(bg="#e0e0e0")
+        self.canvas.config(cursor="cross")
+
     def toggle_format_painter(self):
         if not self.selected_box: return
         if getattr(self, 'format_source_box', None):
-            self.format_source_box = None
-            self.btn_format_painter.config(bg="#e0e0e0")
-            self.canvas.config(cursor="cross")
+            self.clear_painters()
         else:
+            self.clear_painters()
             self.format_source_box = copy.deepcopy(self.selected_box)
             self.btn_format_painter.config(bg="#4CAF50")
             self.canvas.config(cursor="hand2")
+
+    def toggle_size_painter(self):
+        if not self.selected_box: return
+        if getattr(self, 'size_source_box', None):
+            self.clear_painters()
+        else:
+            self.clear_painters()
+            self.size_source_box = copy.deepcopy(self.selected_box)
+            self.btn_size_painter.config(bg="#4CAF50")
+            self.canvas.config(cursor="hand2")
+
+    def toggle_aio_painter(self):
+        if not self.selected_box: return
+        if getattr(self, 'aio_source_box', None):
+            self.clear_painters()
+        else:
+            self.clear_painters()
+            self.aio_source_box = copy.deepcopy(self.selected_box)
+            self.btn_aio_painter.config(bg="#4CAF50")
+            self.canvas.config(cursor="hand2")
+
+    def apply_size_paste(self, target_box, source_box):
+        src_pts = source_box["points"]
+        src_w = max(p[0] for p in src_pts) - min(p[0] for p in src_pts)
+        src_h = max(p[1] for p in src_pts) - min(p[1] for p in src_pts)
+
+        tgt_pts = target_box["points"]
+        tgt_xs = [p[0] for p in tgt_pts]
+        tgt_ys = [p[1] for p in tgt_pts]
+        tgt_w = max(tgt_xs) - min(tgt_xs)
+        tgt_h = max(tgt_ys) - min(tgt_ys)
+
+        cx = sum(tgt_xs) / len(tgt_xs)
+        cy = sum(tgt_ys) / len(tgt_ys)
+
+        sx = src_w / tgt_w if tgt_w > 0 else 1
+        sy = src_h / tgt_h if tgt_h > 0 else 1
+
+        new_pts = [(int(round(cx + (p[0]-cx)*sx)), int(round(cy + (p[1]-cy)*sy))) for p in tgt_pts]
+        if is_valid_poly(new_pts):
+            target_box["points"] = new_pts
 
     def copy_box(self, event=None):
         if self.selected_box:
@@ -722,7 +822,7 @@ class EditorWindow:
     def toggle_draw_rect_mode(self):
         self.drawing_rect_mode = not getattr(self, 'drawing_rect_mode', False)
         if self.drawing_rect_mode:
-            if self.drawing_poly_mode: self.toggle_draw_mode()
+            if getattr(self, 'drawing_poly_mode', False): self.toggle_draw_mode()
             self.btn_draw_rect.config(bg="#4CAF50", text="[Trwa rysowanie...]")
             self.canvas.config(cursor="crosshair")
             self._set_selected_box(None)
@@ -774,7 +874,6 @@ class EditorWindow:
             new_w, new_h = int(img_w * self.scale), int(img_h * self.scale)
             if new_w > 10000 or new_h > 10000: return
 
-            # Użycie OpenCV dla błyskawicznego skalowania!
             resized_cv = cv2.resize(img_rgb, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
             self.tk_img = ImageTk.PhotoImage(image=Image.fromarray(resized_cv))
 
@@ -803,9 +902,17 @@ class EditorWindow:
                     self.canvas.create_line(flat_pts, fill=color, width=2)
 
             if self.selected_box:
-                for pt in self.selected_box["points"]:
-                    px, py = int(pt[0]*self.scale) + self.offset_x, int(pt[1]*self.scale) + self.offset_y
-                    self.canvas.create_rectangle(px-4, py-4, px+4, py+4, fill="magenta", outline="white", width=1)
+                pts = self.selected_box["points"]
+                N = len(pts)
+                for i in range(N):
+                    # Vertex
+                    px, py = int(pts[i][0]*self.scale) + self.offset_x, int(pts[i][1]*self.scale) + self.offset_y
+                    self.canvas.create_rectangle(px-4, py-4, px+4, py+4, fill="#2196F3", outline="white", width=1)
+                    # Edge Midpoint
+                    p_next = pts[(i+1)%N]
+                    mx, my = (pts[i][0] + p_next[0]) / 2.0, (pts[i][1] + p_next[1]) / 2.0
+                    mpx, mpy = int(mx*self.scale) + self.offset_x, int(my*self.scale) + self.offset_y
+                    self.canvas.create_oval(mpx-4, mpy-4, mpx+4, mpy+4, fill="#FF9800", outline="white", width=1)
 
         if getattr(self, 'drawing_poly_mode', False) and len(self.current_poly_points) > 0:
             for i in range(len(self.current_poly_points) - 1):
@@ -856,11 +963,31 @@ class EditorWindow:
             clicked_box["valign"] = self.format_source_box.get("valign", "Środek")
             clicked_box["angle"] = self.format_source_box.get("angle", 0.0)
             clicked_box["line_spacing"] = self.format_source_box.get("line_spacing", 2)
+            self.clear_painters()
+            self.processor.image_changed = True
+            self._set_selected_box(clicked_box)
+            self.update_sidebar()
+            self.redraw_canvas()
+            return
 
-            self.format_source_box = None
-            self.btn_format_painter.config(bg="#e0e0e0")
-            self.canvas.config(cursor="cross")
+        if getattr(self, 'size_source_box', None) and clicked_box:
+            self.apply_size_paste(clicked_box, self.size_source_box)
+            self.clear_painters()
+            self.processor.image_changed = True
+            self._set_selected_box(clicked_box)
+            self.update_sidebar()
+            self.redraw_canvas()
+            return
 
+        if getattr(self, 'aio_source_box', None) and clicked_box:
+            clicked_box["font_family"] = self.aio_source_box["font_family"]
+            clicked_box["font_size"] = self.aio_source_box["font_size"]
+            clicked_box["alignment"] = self.aio_source_box["alignment"]
+            clicked_box["valign"] = self.aio_source_box.get("valign", "Środek")
+            clicked_box["angle"] = self.aio_source_box.get("angle", 0.0)
+            clicked_box["line_spacing"] = self.aio_source_box.get("line_spacing", 2)
+            self.apply_size_paste(clicked_box, self.aio_source_box)
+            self.clear_painters()
             self.processor.image_changed = True
             self._set_selected_box(clicked_box)
             self.update_sidebar()
@@ -868,10 +995,25 @@ class EditorWindow:
             return
 
         if self.selected_box:
-            for i, pt in enumerate(self.selected_box["points"]):
+            pts = self.selected_box["points"]
+            N = len(pts)
+            for i, pt in enumerate(pts):
                 dist = math.hypot(pt[0] - orig_x, pt[1] - orig_y)
                 if dist < 15 / self.scale:
                     self.dragged_vertex_idx = i
+                    self.drag_start_x = orig_x
+                    self.drag_start_y = orig_y
+                    self.drag_start_points = copy.deepcopy(pts)
+                    return
+            for i in range(N):
+                p1, p2 = pts[i], pts[(i+1)%N]
+                mx, my = (p1[0]+p2[0])/2.0, (p1[1]+p2[1])/2.0
+                dist = math.hypot(mx - orig_x, my - orig_y)
+                if dist < 15 / self.scale:
+                    self.dragged_edge_idx = i
+                    self.drag_start_x = orig_x
+                    self.drag_start_y = orig_y
+                    self.drag_start_points = copy.deepcopy(pts)
                     return
 
         if clicked_box:
@@ -881,13 +1023,14 @@ class EditorWindow:
             self.dragged_box = True
             self.drag_start_x = orig_x
             self.drag_start_y = orig_y
+            self.drag_start_points = copy.deepcopy(self.selected_box["points"])
             self.redraw_canvas()
         else:
             self._set_selected_box(None)
             self.update_sidebar()
             self.redraw_canvas()
 
-        if not clicked_box and self.dragged_vertex_idx is None:
+        if not clicked_box and self.dragged_vertex_idx is None and getattr(self, 'dragged_edge_idx', None) is None:
             self.is_panning = True
             self.pan_last_x = event.x
             self.pan_last_y = event.y
@@ -903,20 +1046,118 @@ class EditorWindow:
 
         if self.dragged_vertex_idx is not None and self.selected_box:
             orig_x, orig_y = self.get_orig_coords(event.x, event.y)
-            h_img, w_img = self.processor.original_cv_image.shape[:2]
-            orig_x = max(0, min(w_img, orig_x))
-            orig_y = max(0, min(h_img, orig_y))
-            self.selected_box["points"][self.dragged_vertex_idx] = (int(orig_x), int(orig_y))
-            self.redraw_canvas()
+            dx = orig_x - self.drag_start_x
+            dy = orig_y - self.drag_start_y
+            if event.state & 0x0001:
+                if abs(dx) > abs(dy): dy = 0
+                else: dx = 0
+
+            new_pts = copy.deepcopy(self.drag_start_points)
+            new_pts[self.dragged_vertex_idx] = (int(self.drag_start_points[self.dragged_vertex_idx][0] + dx),
+                                                int(self.drag_start_points[self.dragged_vertex_idx][1] + dy))
+            if is_valid_poly(new_pts):
+                self.selected_box["points"] = new_pts
+                self._update_size_spinners_silently(new_pts)
+                self.redraw_canvas()
+
+        elif getattr(self, 'dragged_edge_idx', None) is not None and self.selected_box:
+            orig_x, orig_y = self.get_orig_coords(event.x, event.y)
+            dx = orig_x - self.drag_start_x
+            dy = orig_y - self.drag_start_y
+            if event.state & 0x0001:
+                if abs(dx) > abs(dy): dy = 0
+                else: dx = 0
+
+            P = self.drag_start_points
+            N = len(P)
+            i = self.dragged_edge_idx
+
+            E1 = P[i]
+            E2 = P[(i+1)%N]
+            T1 = (E1[0]+dx, E1[1]+dy)
+            V_T = (E2[0]-E1[0], E2[1]-E1[1])
+            R1 = P[(i-1)%N]
+            V_R1 = (E1[0]-R1[0], E1[1]-R1[1])
+            R2 = P[(i+2)%N]
+            V_R2 = (E2[0]-R2[0], E2[1]-R2[1])
+
+            new_E1 = get_line_intersection(R1, V_R1, T1, V_T)
+            new_E2 = get_line_intersection(R2, V_R2, T1, V_T)
+            if new_E1 is None: new_E1 = (E1[0]+dx, E1[1]+dy)
+            if new_E2 is None: new_E2 = (E2[0]+dx, E2[1]+dy)
+
+            new_pts = copy.deepcopy(P)
+            new_pts[i] = (int(round(new_E1[0])), int(round(new_E1[1])))
+            new_pts[(i+1)%N] = (int(round(new_E2[0])), int(round(new_E2[1])))
+
+            if is_valid_poly(new_pts):
+                self.selected_box["points"] = new_pts
+                self._update_size_spinners_silently(new_pts)
+                self.redraw_canvas()
 
         elif getattr(self, 'dragged_box', False) and self.selected_box:
             orig_x, orig_y = self.get_orig_coords(event.x, event.y)
             dx = orig_x - self.drag_start_x
             dy = orig_y - self.drag_start_y
-            self.selected_box["points"] = [(p[0]+dx, p[1]+dy) for p in self.selected_box["points"]]
-            self.drag_start_x = orig_x
-            self.drag_start_y = orig_y
-            self.redraw_canvas()
+
+            if event.state & 0x0001:
+                if abs(dx) > abs(dy): dy = 0
+                else: dx = 0
+
+            temp_points = [(p[0]+dx, p[1]+dy) for p in self.drag_start_points]
+
+            self.canvas.delete("snap_line")
+            if event.state & 0x0001:
+                xs = [p[0] for p in temp_points]
+                ys = [p[1] for p in temp_points]
+                t_minx, t_maxx, t_cx = min(xs), max(xs), sum(xs)/len(xs)
+                t_miny, t_maxy, t_cy = min(ys), max(ys), sum(ys)/len(ys)
+
+                snap_threshold = 10 / self.scale
+                best_dx, best_dy = 0, 0
+                min_diff_x, min_diff_y = float('inf'), float('inf')
+                snap_lines_x, snap_lines_y = [], []
+
+                for box in self.processor.boxes:
+                    if box["id"] == self.selected_box["id"]: continue
+                    b_xs = [p[0] for p in box["points"]]
+                    b_ys = [p[1] for p in box["points"]]
+                    b_minx, b_maxx, b_cx = min(b_xs), max(b_xs), sum(b_xs)/len(b_xs)
+                    b_miny, b_maxy, b_cy = min(b_ys), max(b_ys), sum(b_ys)/len(b_ys)
+
+                    if dy == 0:
+                        for target_x in [b_minx, b_maxx, b_cx]:
+                            for source_x in [t_minx, t_maxx, t_cx]:
+                                diff = target_x - source_x
+                                if abs(diff) < snap_threshold and abs(diff) < abs(min_diff_x):
+                                    min_diff_x = diff
+                                    best_dx = diff
+                                    snap_lines_x = [target_x]
+
+                    if dx == 0:
+                        for target_y in [b_miny, b_maxy, b_cy]:
+                            for source_y in [t_miny, t_maxy, t_cy]:
+                                diff = target_y - source_y
+                                if abs(diff) < snap_threshold and abs(diff) < abs(min_diff_y):
+                                    min_diff_y = diff
+                                    best_dy = diff
+                                    snap_lines_y = [target_y]
+
+                if min_diff_x != float('inf'):
+                    temp_points = [(p[0]+best_dx, p[1]) for p in temp_points]
+                    for x in snap_lines_x:
+                        px = x * self.scale + self.offset_x
+                        self.canvas.create_line(px, 0, px, self.canvas.winfo_height(), fill="cyan", dash=(4,4), tags="snap_line")
+                if min_diff_y != float('inf'):
+                    temp_points = [(p[0], p[1]+best_dy) for p in temp_points]
+                    for y in snap_lines_y:
+                        py = y * self.scale + self.offset_y
+                        self.canvas.create_line(0, py, self.canvas.winfo_width(), py, fill="cyan", dash=(4,4), tags="snap_line")
+
+            if is_valid_poly(temp_points):
+                self.selected_box["points"] = temp_points
+                self._update_size_spinners_silently(temp_points)
+                self.redraw_canvas()
 
         elif getattr(self, 'is_panning', False):
             dx = event.x - self.pan_last_x
@@ -927,7 +1168,16 @@ class EditorWindow:
             self.pan_last_y = event.y
             self.redraw_canvas()
 
+    def _update_size_spinners_silently(self, pts):
+        self._is_updating_sidebar = True
+        xs = [p[0] for p in pts]
+        ys = [p[1] for p in pts]
+        self.width_var.set(str(int(max(xs) - min(xs))))
+        self.height_var.set(str(int(max(ys) - min(ys))))
+        self._is_updating_sidebar = False
+
     def on_left_release(self, event):
+        self.canvas.delete("snap_line")
         if getattr(self, 'drawing_rect_mode', False) and hasattr(self, 'rect_start_x'):
             orig_x, orig_y = self.get_orig_coords(event.x, event.y)
             if abs(orig_x - self.rect_start_x) > 5 and abs(orig_y - self.rect_start_y) > 5:
@@ -947,6 +1197,11 @@ class EditorWindow:
 
         if self.dragged_vertex_idx is not None:
             self.dragged_vertex_idx = None
+            self.processor.image_changed = True
+            self.redraw_canvas()
+
+        if getattr(self, 'dragged_edge_idx', None) is not None:
+            self.dragged_edge_idx = None
             self.processor.image_changed = True
             self.redraw_canvas()
 
@@ -992,8 +1247,11 @@ class EditorWindow:
         self.spacing_var.set("")
         self.shift_x_var.set("0")
         self.shift_y_var.set("0")
+        self.width_var.set("0")
+        self.height_var.set("0")
 
-        widgets_to_toggle = [self.btn_font, self.spin_size, self.combo_align, self.combo_valign, self.spin_angle, self.spin_spacing, self.spin_x, self.spin_y]
+        widgets_to_toggle = [self.btn_font, self.spin_size, self.combo_align, self.combo_valign,
+                             self.spin_angle, self.spin_spacing, self.spin_x, self.spin_y, self.spin_w, self.spin_h]
 
         if self.selected_box:
             self.btn_delete.config(state="normal")
@@ -1022,6 +1280,12 @@ class EditorWindow:
             self.spacing_var.set(str(self.selected_box.get("line_spacing", 2)))
             self.shift_x_var.set(str(self.selected_box.get("shift_x", 0)))
             self.shift_y_var.set(str(self.selected_box.get("shift_y", 0)))
+
+            pts = self.selected_box["points"]
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            self.width_var.set(str(int(max(xs) - min(xs))))
+            self.height_var.set(str(int(max(ys) - min(ys))))
 
             for w in widgets_to_toggle:
                 state_mode = "readonly" if isinstance(w, ttk.Combobox) else "normal"
@@ -1091,6 +1355,29 @@ class EditorWindow:
                 if self.selected_box.get("shift_y", 0) != v:
                     self.selected_box["shift_y"] = v
                     needs_pixel_update = True
+            except ValueError: pass
+
+            try:
+                new_w = int(self.width_var.get())
+                new_h = int(self.height_var.get())
+                if new_w < 3: new_w = 3
+                if new_h < 3: new_h = 3
+
+                pts = self.selected_box["points"]
+                xs = [p[0] for p in pts]
+                ys = [p[1] for p in pts]
+                cur_w = max(xs) - min(xs)
+                cur_h = max(ys) - min(ys)
+
+                if (new_w != int(cur_w) and new_w > 0) or (new_h != int(cur_h) and new_h > 0):
+                    cx = sum(xs) / len(xs)
+                    cy = sum(ys) / len(ys)
+                    sx = new_w / cur_w if cur_w > 0 else 1
+                    sy = new_h / cur_h if cur_h > 0 else 1
+                    new_pts = [(int(round(cx + (p[0]-cx)*sx)), int(round(cy + (p[1]-cy)*sy))) for p in pts]
+                    if is_valid_poly(new_pts):
+                        self.selected_box["points"] = new_pts
+                        needs_pixel_update = True
             except ValueError: pass
 
             if self.selected_box["alignment"] != self.align_var.get():
