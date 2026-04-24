@@ -179,6 +179,15 @@ class EditorWindow:
         self.create_menu()
         self.process_all_images()
 
+    def show_author(self):
+        messagebox.showinfo(
+            "Autor",
+            "Tłumacz OCR\n\n"
+            "Autor: Mateusz Bojarski\n"
+            "Do wewnętrznego użytku w AOMB Polska Sp. z o.o.\n"
+            "Wersja 1.0"
+        )
+
     def create_menu(self):
         root = self.frame.winfo_toplevel()
         menubar = tk.Menu(root)
@@ -193,14 +202,6 @@ class EditorWindow:
         menubar.add_cascade(label="O programie", menu=help_menu)
 
         root.config(menu=menubar)
-
-        messagebox.showinfo(
-            "Autor",
-            "Tłumacz OCR\n\n"
-            "Autor: Mateusz Bojarski\n"
-            "Do wewnętrznego użytku w AOMB Polska Sp. z o.o.\n"
-            "Wersja 1.0"
-        )
 
     def process_all_images(self):
         if not self.image_files:

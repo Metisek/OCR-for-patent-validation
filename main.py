@@ -29,18 +29,25 @@ class AppLauncher:
         self.build_launcher_ui()
 
     def set_app_icon(self):
-        """Próbuje załadować plik icon.png lub icon.ico z folderu aplikacji"""
-        icon_path_png = os.path.join(os.path.dirname(__file__), 'icon.png')
-        icon_path_ico = os.path.join(os.path.dirname(__file__), 'icon.ico')
+        import sys
+        # Magia dla PyInstaller (tryb --onefile)
+        if getattr(sys, 'frozen', False):
+            # Jeśli program jest uruchomiony jako plik .exe
+            application_path = sys._MEIPASS
+        else:
+            # Jeśli program jest uruchomiony jako zwykły skrypt .py
+            application_path = os.path.dirname(__file__)
+
+        icon_path_png = os.path.join(application_path, 'icon.png')
+        icon_path_ico = os.path.join(application_path, 'icon.ico')
 
         try:
             if os.path.exists(icon_path_png):
-                # Obsługa PNG przez PIL (uniwersalne)
+                from PIL import Image, ImageTk
                 icon_img = Image.open(icon_path_png)
-                self.icon_photo = ImageTk.PhotoImage(icon_img) # Musi być zachowane w self, inaczej garbage collector usunie
+                self.icon_photo = ImageTk.PhotoImage(icon_img)
                 self.root.iconphoto(True, self.icon_photo)
             elif os.path.exists(icon_path_ico):
-                # Natywna obsługa ICO dla Windows
                 self.root.iconbitmap(icon_path_ico)
         except Exception as e:
             print(f"Nie udało się załadować ikony aplikacji: {e}")
