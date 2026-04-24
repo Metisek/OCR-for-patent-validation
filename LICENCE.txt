@@ -1,0 +1,10 @@
+Tłumacz OCR
+
+Autor: Mateusz Bojarski
+
+#TODO - ustalenie typu licencji - obecnie kod jest na GitHubie publicznym, w razie potrzeby można zmienić miejsce umiejscowienia programu do version control
+Program przeznaczony do wewnętrznego użytku w AOMB Polska Sp. z o.o.
+Rozpowszechnianie poza AOMB Polska Sp. z o.o., modyfikowanie, sublicencjonowanie lub komercyjne udostępnianie osobom trzecim wymaga uprzedniej pisemnej zgody uprawnionego podmiotu.
+
+#TODO - kto uprawniony?
+© Mateusz Bojarski / AOMB Polska Sp. z o.o. — do ustalenia zgodnie z umową o pracę i zasadami obowiązującymi w firmie.

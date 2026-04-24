@@ -35,7 +35,7 @@ class ConflictDialog(tk.Toplevel):
         self.choice = "skip"
         self.apply_to_all = False
 
-        tk.Label(self, text=f"Plik '{filename}' już istnieje w tym folderze.\nWybierz co zrobić:", justify=tk.CENTER).pack(pady=10)
+        tk.Label(self, text=f"Plik '{filename}' już istnieje w docelowym folderze.\nWybierz co zrobić:", justify=tk.CENTER).pack(pady=10)
 
         btn_frame = tk.Frame(self)
         btn_frame.pack(pady=5)
@@ -172,7 +172,35 @@ class EditorWindow:
         self.last_font_size = 24
         self.last_line_spacing = 2
 
+        # SYSTEM UNDO/REDO
+        self.global_history = []
+        self.history_index = -1
+
+        self.create_menu()
         self.process_all_images()
+
+    def create_menu(self):
+        root = self.frame.winfo_toplevel()
+        menubar = tk.Menu(root)
+
+        file_menu = tk.Menu(menubar, tearoff=0)
+        file_menu.add_command(label="Zakończ i wróć", command=self.on_close)
+        file_menu.add_command(label="Wyjdź z aplikacji", command=root.quit)
+        menubar.add_cascade(label="Plik", menu=file_menu)
+
+        help_menu = tk.Menu(menubar, tearoff=0)
+        help_menu.add_command(label="Autor", command=self.show_author)
+        menubar.add_cascade(label="O programie", menu=help_menu)
+
+        root.config(menu=menubar)
+
+        messagebox.showinfo(
+            "Autor",
+            "Tłumacz OCR\n\n"
+            "Autor: Mateusz Bojarski\n"
+            "Do wewnętrznego użytku w AOMB Polska Sp. z o.o.\n"
+            "Wersja 1.0"
+        )
 
     def process_all_images(self):
         if not self.image_files:
@@ -180,17 +208,40 @@ class EditorWindow:
             self.on_close()
             return
 
+        # --- SPRAWDZANIE MODELI OCR ---
+        if self.engine == "paddleocr":
+            paddle_path = os.path.join(os.path.expanduser("~"), ".paddleocr")
+            if not os.path.exists(paddle_path):
+                ans = messagebox.askokcancel("Wymagane pobieranie modelu",
+                                             "Model sztucznej inteligencji PaddleOCR nie został jeszcze pobrany na ten komputer.\n\n"
+                                             "Zajmie on ok. 15 MB miejsca na dysku i zostanie zapisany w katalogu:\n" + paddle_path + "\n\n"
+                                             "Czy chcesz kontynuować i pobrać model?")
+                if not ans:
+                    self.on_close()
+                    return
+        elif self.engine == "easyocr":
+            easy_path = os.path.join(os.path.expanduser("~"), ".EasyOCR")
+            if not os.path.exists(easy_path):
+                ans = messagebox.askokcancel("Wymagane pobieranie modelu",
+                                             "Model sztucznej inteligencji EasyOCR nie został jeszcze pobrany na ten komputer.\n\n"
+                                             "Zajmie on ok. 40-70 MB miejsca na dysku i zostanie zapisany w katalogu:\n" + easy_path + "\n\n"
+                                             "Czy chcesz kontynuować i pobrać model?")
+                if not ans:
+                    self.on_close()
+                    return
+
         for widget in self.frame.winfo_children():
             if isinstance(widget, tk.Button) and widget.cget("text") == "Rozpocznij przetwarzanie":
                 widget.config(state=tk.DISABLED, text="Przetwarzanie trwa... (Proszę czekać)")
 
         root_win = self.frame.winfo_toplevel()
         root_win.geometry("450x580")
+        root_win.title("Tłumacz OCR")
 
         self.progress_frame = tk.Frame(self.frame, pady=15)
         self.progress_frame.pack(side=tk.BOTTOM, fill=tk.X)
 
-        tk.Label(self.progress_frame, text="Inicjalizacja silnika OCR...", font=("Arial", 11, "bold"), fg="#0052cc").pack()
+        tk.Label(self.progress_frame, text="Inicjalizacja i analiza obrazów...", font=("Arial", 11, "bold"), fg="#0052cc").pack()
         progress_bar = ttk.Progressbar(self.progress_frame, orient="horizontal", length=350, mode="determinate")
         progress_bar.pack(pady=5)
         progress_bar["maximum"] = len(self.image_files)
@@ -225,7 +276,9 @@ class EditorWindow:
 
         if self.image_files:
             self.setup_ui()
+            self._save_global_state() # STARTOWY PUNKT DLA UNDO (Indeks 0)
             self.select_image(0, auto_scroll=True)
+
             root_win.bind("<Delete>", self.handle_delete_key)
             root_win.bind("<Control-c>", self.copy_box)
             root_win.bind("<Control-v>", self.paste_box)
@@ -235,9 +288,67 @@ class EditorWindow:
             root_win.bind("<C>", self.handle_c_key)
             root_win.bind("<x>", self.handle_x_key)
             root_win.bind("<X>", self.handle_x_key)
+
+            # Podpinanie Cofania
+            root_win.bind("<Control-z>", self.undo)
+            root_win.bind("<Control-Z>", self.undo)
+            root_win.bind("<Control-y>", self.redo)
+            root_win.bind("<Control-Y>", self.redo)
+            root_win.bind("<Control-Alt-z>", self.redo)
+            root_win.bind("<Control-Alt-Z>", self.redo)
         else:
             self.on_close()
 
+    # --- SYSTEM UNDO / REDO ---
+    def _save_global_state(self):
+        state = {
+            'filename': self.image_files[self.current_index],
+            'boxes_dict': {fn: copy.deepcopy(p.boxes) for fn, p in self.processors.items()}
+        }
+        self.global_history = self.global_history[:self.history_index + 1]
+        self.global_history.append(state)
+
+        if len(self.global_history) > 11: # Maksymalnie 10 operacji w pamięci
+            self.global_history.pop(0)
+
+        self.history_index = len(self.global_history) - 1
+
+    def undo(self, event=None):
+        focused = self.frame.focus_get()
+        if isinstance(focused, (tk.Text, tk.Entry, tk.Spinbox, ttk.Spinbox)):
+            return
+
+        if self.history_index > 0:
+            self.history_index -= 1
+            self._restore_global_state()
+
+    def redo(self, event=None):
+        focused = self.frame.focus_get()
+        if isinstance(focused, (tk.Text, tk.Entry, tk.Spinbox, ttk.Spinbox)):
+            return
+
+        if self.history_index < len(self.global_history) - 1:
+            self.history_index += 1
+            self._restore_global_state()
+
+    def _restore_global_state(self):
+        state = self.global_history[self.history_index]
+        for fn, boxes in state['boxes_dict'].items():
+            self.processors[fn].boxes = copy.deepcopy(boxes)
+            self.processors[fn].image_changed = True
+
+        target_file = state['filename']
+        if self.image_files[self.current_index] != target_file:
+            self.current_index = self.image_files.index(target_file)
+            self.processor = self.processors[target_file]
+            self.frame.master.title(f"Tłumacz OCR - {target_file} ({self.current_index + 1}/{len(self.image_files)})")
+            self.update_gallery_highlight(auto_scroll=True)
+
+        self._set_selected_box(None)
+        self.update_sidebar()
+        self.redraw_canvas()
+
+    # --- UI ---
     def setup_ui(self):
         for widget in self.frame.winfo_children(): widget.destroy()
 
@@ -287,7 +398,7 @@ class EditorWindow:
         tk.Button(export_frame, text="Eksportuj Bieżący", command=self.export_current, bg="#4CAF50", fg="white").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
         tk.Button(export_frame, text="Eksport Wszystkie", command=self.export_all, bg="#2196F3", fg="white").pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(2, 0))
 
-        tk.Button(bottom_container, text="Zakończ i Wyjdź do Menu", command=self.on_close).pack(fill=tk.X)
+        tk.Button(bottom_container, text="Zakończ i Wyjdź", command=self.on_close).pack(fill=tk.X)
 
         self.paned_window = tk.PanedWindow(self.sidebar_container, orient=tk.VERTICAL, sashwidth=6, sashrelief=tk.RAISED, bg="#cccccc")
         self.paned_window.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
@@ -445,8 +556,8 @@ class EditorWindow:
 
         btn_frame = tk.Frame(self.tools_inner, bg="#f0f0f0")
         btn_frame.pack(fill=tk.X, pady=5)
-        tk.Button(btn_frame, text="Ignoruj", command=self.ignore_box).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
-        tk.Button(btn_frame, text="Przywróć", command=self.revert_to_original).pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(2, 0))
+        tk.Button(btn_frame, text="Ignoruj (Bez zmian)", command=self.ignore_box).pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 2))
+        tk.Button(btn_frame, text="Przywróć (OCR)", command=self.revert_to_original).pack(side=tk.RIGHT, fill=tk.X, expand=True, padx=(2, 0))
 
         self.bottom_pane = tk.Frame(self.paned_window, bg="#f0f0f0")
         self.paned_window.add(self.bottom_pane, minsize=100, stretch="always")
@@ -526,6 +637,7 @@ class EditorWindow:
         for box in self.processor.boxes:
             box["font_family"] = font
         self.processor.image_changed = True
+        self._save_global_state()
         self.redraw_canvas()
 
     def clear_painters(self):
@@ -601,6 +713,7 @@ class EditorWindow:
             self._set_selected_box(new_box)
             self.processor.image_changed = True
             self.update_sidebar()
+            self._save_global_state()
             self.redraw_canvas()
 
     def handle_delete_key(self, event):
@@ -702,7 +815,7 @@ class EditorWindow:
 
         self.current_index = index
         filename = self.image_files[self.current_index]
-        self.frame.master.title(f"Edytor - {filename} ({self.current_index + 1}/{len(self.image_files)})")
+        self.frame.master.title(f"Tłumacz OCR - {filename} ({self.current_index + 1}/{len(self.image_files)})")
 
         self.processor = self.processors[filename]
         self._set_selected_box(None)
@@ -905,10 +1018,8 @@ class EditorWindow:
                 pts = self.selected_box["points"]
                 N = len(pts)
                 for i in range(N):
-                    # Vertex
                     px, py = int(pts[i][0]*self.scale) + self.offset_x, int(pts[i][1]*self.scale) + self.offset_y
                     self.canvas.create_rectangle(px-4, py-4, px+4, py+4, fill="#2196F3", outline="white", width=1)
-                    # Edge Midpoint
                     p_next = pts[(i+1)%N]
                     mx, my = (pts[i][0] + p_next[0]) / 2.0, (pts[i][1] + p_next[1]) / 2.0
                     mpx, mpy = int(mx*self.scale) + self.offset_x, int(my*self.scale) + self.offset_y
@@ -967,6 +1078,7 @@ class EditorWindow:
             self.processor.image_changed = True
             self._set_selected_box(clicked_box)
             self.update_sidebar()
+            self._save_global_state()
             self.redraw_canvas()
             return
 
@@ -976,6 +1088,7 @@ class EditorWindow:
             self.processor.image_changed = True
             self._set_selected_box(clicked_box)
             self.update_sidebar()
+            self._save_global_state()
             self.redraw_canvas()
             return
 
@@ -991,6 +1104,7 @@ class EditorWindow:
             self.processor.image_changed = True
             self._set_selected_box(clicked_box)
             self.update_sidebar()
+            self._save_global_state()
             self.redraw_canvas()
             return
 
@@ -1192,22 +1306,26 @@ class EditorWindow:
             self.canvas.delete("temp_rect")
             self.toggle_draw_rect_mode()
             self.update_sidebar()
+            self._save_global_state()
             self.redraw_canvas()
             return
 
         if self.dragged_vertex_idx is not None:
             self.dragged_vertex_idx = None
             self.processor.image_changed = True
+            self._save_global_state()
             self.redraw_canvas()
 
         if getattr(self, 'dragged_edge_idx', None) is not None:
             self.dragged_edge_idx = None
             self.processor.image_changed = True
+            self._save_global_state()
             self.redraw_canvas()
 
         if getattr(self, 'dragged_box', False):
             self.dragged_box = False
             self.processor.image_changed = True
+            self._save_global_state()
             self.redraw_canvas()
 
         if getattr(self, 'is_panning', False):
@@ -1229,6 +1347,7 @@ class EditorWindow:
             self._set_selected_box(new_box)
             self.toggle_draw_mode()
             self.update_sidebar()
+            self._save_global_state()
             self.redraw_canvas()
             self.canvas.update()
 
@@ -1237,6 +1356,7 @@ class EditorWindow:
             self.processor.delete_box(self.selected_box["id"])
             self._set_selected_box(None)
             self.update_sidebar()
+            self._save_global_state()
             self.redraw_canvas()
 
     def update_sidebar(self):
@@ -1392,6 +1512,7 @@ class EditorWindow:
 
             if needs_pixel_update:
                 self.processor.image_changed = True
+                self._save_global_state()
                 self.redraw_canvas()
 
     def ignore_box(self):
@@ -1400,6 +1521,7 @@ class EditorWindow:
             self.selected_box["new_text"] = None
             self.processor.image_changed = True
             self.update_sidebar()
+            self._save_global_state()
             self.redraw_canvas()
 
     def revert_to_original(self):
@@ -1408,4 +1530,5 @@ class EditorWindow:
             self.selected_box["new_text"] = None
             self.processor.image_changed = True
             self.update_sidebar()
+            self._save_global_state()
             self.redraw_canvas()
